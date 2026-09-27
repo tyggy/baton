@@ -19,3 +19,4 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "client-legacy", 
 http-body-util = "0.1"
 bytes = "1"
 flate2 = "1"
+libc = "0.2"
