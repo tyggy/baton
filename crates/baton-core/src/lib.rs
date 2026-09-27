@@ -5,6 +5,7 @@
 pub mod claude;
 pub mod codex;
 pub mod pyfmt;
+pub mod sessions;
 
 use serde_json::Value;
 use std::collections::HashMap;

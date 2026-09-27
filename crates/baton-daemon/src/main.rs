@@ -24,6 +24,23 @@ fn arg(args: &[String], name: &str, default: &str) -> String {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("sessions") {
+        // The session list as JSON (parity with sessions_core.load_all_sessions).
+        let t0 = std::time::Instant::now();
+        let (sessions, headless) =
+            baton_core::sessions::build_all(&baton_core::sessions::Dirs::default_home(), None);
+        eprintln!(
+            "{} sessions, {} headless in {} ms",
+            sessions.len(),
+            headless.len(),
+            t0.elapsed().as_millis()
+        );
+        println!(
+            "{}",
+            serde_json::json!({"sessions": sessions, "headless": headless})
+        );
+        return;
+    }
     if args.get(1).map(String::as_str) != Some("serve") {
         eprintln!("baton {}\n{USAGE}", env!("CARGO_PKG_VERSION"));
         std::process::exit(2);
