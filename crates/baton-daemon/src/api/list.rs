@@ -42,6 +42,11 @@ const LIVE_IDLE_AFTER_MS: u64 = 60_000;
 const LIVE_QUIET_AFTER_INPUT_MS: u64 = 3000;
 const SESSIONS_UPDATE_EVERY: Duration = Duration::from_secs(5);
 const KEEPALIVE: Duration = Duration::from_secs(15);
+/// The Python server runs its optional background jobs (entity classifier,
+/// title-drift check, tmux window retitles) off `/api/local-sessions` hits.
+/// While those stay in Python, a native hit forwards a request upstream at
+/// most this often so they keep running.
+const PLUGIN_KICK_EVERY_MS: u64 = 300_000;
 /// Event types computed natively — not relayed from the upstream stream.
 const NATIVE_EVENTS: [&str; 2] = ["sessions_delta", "sessions_update"];
 
@@ -71,6 +76,7 @@ struct Engine {
     built: tokio::sync::Notify,
     headless: Mutex<Headless>,
     last_poll_ms: AtomicU64,
+    last_kick_ms: AtomicU64,
 }
 
 static ENGINE: tokio::sync::OnceCell<Arc<Engine>> = tokio::sync::OnceCell::const_new();
@@ -92,7 +98,13 @@ pub async fn route(state: &Arc<State>, req: Request<Incoming>) -> Routed {
     let h = req.headers();
     Ok(match path.as_str() {
         "/api/local-sessions" => {
-            eng.last_poll_ms.store(State::now_ms(), Ordering::Relaxed);
+            let now = State::now_ms();
+            eng.last_poll_ms.store(now, Ordering::Relaxed);
+            if now.saturating_sub(eng.last_kick_ms.load(Ordering::Relaxed)) > PLUGIN_KICK_EVERY_MS {
+                eng.last_kick_ms.store(now, Ordering::Relaxed);
+                let e = eng.clone();
+                tokio::spawn(async move { e.upstream.drain("/api/local-sessions").await });
+            }
             match eng.payload(filter).await {
                 Some(e) => serve_payload(h, &e.bytes, &e.etag, &e.gz),
                 None => error_500(h, "local-sessions payload build failed"),
@@ -145,6 +157,7 @@ async fn engine(state: &Arc<State>) -> Arc<Engine> {
                 built: tokio::sync::Notify::new(),
                 headless: Mutex::default(),
                 last_poll_ms: AtomicU64::new(0),
+                last_kick_ms: AtomicU64::new(0),
             });
             eng.resolve_csm_dir().await;
             tokio::spawn(live_watcher(eng.clone(), state.clone()));
@@ -592,6 +605,13 @@ impl Upstream {
             .ok()?
             .ok()?;
         resp.status().is_success().then(|| resp.into_body())
+    }
+
+    /// GET and discard the body (for the request's side effects upstream).
+    async fn drain(&self, path: &str) {
+        if let Some(body) = self.open(path).await {
+            let _ = tokio::time::timeout(Duration::from_secs(60), body.collect()).await;
+        }
     }
 
     async fn get_json(&self, path: &str) -> Option<Value> {

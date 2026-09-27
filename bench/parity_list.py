@@ -32,6 +32,9 @@ BIN = os.environ.get("BATON_BIN", str(Path(os.environ.get("CARGO_TARGET_DIR", "t
 PY_PORT = int(os.environ.get("PY_PORT", "19877"))
 RS_PORT = int(os.environ.get("RS_PORT", "19881"))
 ISO_PORT = int(os.environ.get("ISO_PORT", "19882"))
+RELAY_PORT = int(os.environ.get("RELAY_PORT", "19883"))
+FAKE_UP_PORT = int(os.environ.get("FAKE_UP_PORT", "19884"))
+FILTER = os.environ.get("PARITY_FILTER", "GitHub")
 PY_LOG = HOME / "Library/Logs/cs-server.events.jsonl"
 THROWAWAY = HOME / ".claude/projects/-tmp-baton-list-parity"
 
@@ -78,11 +81,11 @@ def wait_port(port, secs=10):
     return False
 
 
-def start_daemon(port, log, env=None):
+def start_daemon(port, log, env=None, upstream=None):
     e = dict(os.environ)
     e.update(env or {})
     p = subprocess.Popen(["nice", BIN, "serve", "--listen", f"127.0.0.1:{port}",
-                          "--upstream", f"http://127.0.0.1:{PY_PORT}"],
+                          "--upstream", f"http://127.0.0.1:{upstream or PY_PORT}"],
                          stdout=subprocess.DEVNULL, stderr=open(log, "w"), env=e)
     if not wait_port(port):
         p.kill()
@@ -267,6 +270,24 @@ def run(tmp, procs):
     st, _, _, _ = get(RS_PORT, "/api/search-index", {"If-None-Match": hs.get("etag", "")})
     check(st in (304, 200), f"search-index ETag → {st}")
 
+    # ── ?project= filter (Python caches it 30 s, no watcher: retry) ──
+    print(f"\n/api/local-sessions?project={FILTER}")
+    q = f"/api/local-sessions?project={FILTER}"
+    for attempt in range(12):
+        t0 = time.time()
+        _, _, f1, _ = get(PY_PORT, q)
+        _, _, fr, _ = get(RS_PORT, q)
+        _, _, f2, _ = get(PY_PORT, q)
+        if fr in (f1, f2):
+            break
+        time.sleep(3)
+    if fr in (f1, f2):
+        check(True, f"byte-identical: {len(flat(json.loads(fr)))} rows")
+    else:
+        ok, rep = compare_list(json.loads(f1), json.loads(fr), json.loads(f2), t0, time.time())
+        print("   ", rep)
+        check(ok, "filtered payload equal outside actively-written rows")
+
     # ── background ──
     print("\n/api/background")
     for attempt in range(5):
@@ -294,6 +315,10 @@ def run(tmp, procs):
     # ── live deltas (isolated HOME, deterministic rows) ──
     print("\n/api/events (isolated HOME, new row → changed / removed)")
     isolated_deltas(tmp, procs)
+
+    # ── relay of upstream events (fake upstream: nothing reaches real clients) ──
+    print("\n/api/events relay (fake upstream)")
+    relay(tmp, procs)
 
     rb = rebuilds(log)
     py = []
@@ -452,6 +477,65 @@ def isolated_deltas(tmp, procs):
     stop.set()
     ka = [e for _, e in events if e.get("type") == ":error"]
     check(not ka, "event stream stayed up")
+
+
+def relay(tmp, procs):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Up(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def send(self, obj):
+            b = json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_GET(self):
+            if self.path == "/api/health":
+                return self.send({"status": "ok", "src": str(tmp / "no-csm-dir")})
+            if self.path == "/api/sessions":
+                return self.send([{"name": "fake-tmux", "status": "idle"}])
+            if self.path != "/api/events":
+                return self.send({})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            try:
+                for i in range(20):
+                    for ev in ({"type": "hook", "n": i, "text": "é"},
+                               {"type": "sessions_delta", "etag": "upstream", "changed": [], "removed": []},
+                               {"type": "sessions_update", "sessions": ["upstream"]}):
+                        self.wfile.write(f"data: {json.dumps(ev)}\n\n".encode())
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    time.sleep(0.5)
+            except OSError:
+                pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", FAKE_UP_PORT), Up)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        home = tmp / "home-relay"
+        (home / ".claude/projects").mkdir(parents=True)
+        procs.append(start_daemon(RELAY_PORT, tmp / "relay.log", {"HOME": str(home), "BATON_BEARER": TOK}, FAKE_UP_PORT))
+        events, stop = [], threading.Event()
+        threading.Thread(target=sse, args=(RELAY_PORT, events, stop), daemon=True).start()
+        time.sleep(8)
+        stop.set()
+        evs = [e for _, e in events]
+        hooks = [e for e in evs if e.get("type") == "hook"]
+        check(hooks and hooks[0] == {"type": "hook", "n": hooks[0]["n"], "text": "é"},
+              f"upstream events relayed ({len(hooks)} hook events)")
+        check(not any(e.get("etag") == "upstream" for e in evs), "upstream sessions_delta not relayed (native)")
+        ups = [e for e in evs if e.get("type") == "sessions_update"]
+        check(ups and all(e["sessions"] == [{"name": "fake-tmux", "status": "idle"}] for e in ups),
+              f"sessions_update from upstream /api/sessions ({len(ups)} in 8 s), upstream's own not relayed")
+    finally:
+        srv.shutdown()
 
 
 if __name__ == "__main__":
