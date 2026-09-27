@@ -3,8 +3,11 @@
 //! forwarded to the Python reference server until the migration is done.
 
 mod api;
+mod cmd;
 mod http;
+mod logs;
 mod proxy;
+mod pyjson;
 mod state;
 
 use hyper::server::conn::http1;
