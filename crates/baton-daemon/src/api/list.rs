@@ -162,7 +162,12 @@ async fn engine(state: &Arc<State>) -> Arc<Engine> {
             eng.resolve_csm_dir().await;
             tokio::spawn(live_watcher(eng.clone(), state.clone()));
             tokio::spawn(sessions_update(eng.clone(), state.clone()));
-            tokio::spawn(relay_upstream_events(eng.clone(), state.clone()));
+            // Every event source is native now (hooks, spawn/resume/kill,
+            // respond, send, resume-ready). Relaying Python's stream only
+            // kept a listener on it — and its own live watcher rebuilding.
+            if std::env::var("BATON_RELAY_UPSTREAM_EVENTS").as_deref() == Ok("1") {
+                tokio::spawn(relay_upstream_events(eng.clone(), state.clone()));
+            }
             eng
         })
         .await
@@ -497,19 +502,18 @@ async fn live_watcher(eng: Arc<Engine>, state: Arc<State>) {
     }
 }
 
-/// `periodic_session_broadcast`: the legacy tmux list every 5 s, fetched
-/// from the upstream server for now (the tmux group ports it).
-async fn sessions_update(eng: Arc<Engine>, state: Arc<State>) {
+/// `periodic_session_broadcast`: the legacy tmux list every 5 s (native,
+/// from the tmux group's cached `get_sessions`).
+async fn sessions_update(_eng: Arc<Engine>, state: Arc<State>) {
     loop {
         tokio::time::sleep(SESSIONS_UPDATE_EVERY).await;
         if !listeners(&state) {
             continue;
         }
-        if let Some(v) = eng.upstream.get_json("/api/sessions").await {
-            let _ = state
-                .events
-                .send(json!({"type": "sessions_update", "sessions": v}));
-        }
+        let v = crate::api::tmux::sessions_value().await;
+        let _ = state
+            .events
+            .send(json!({"type": "sessions_update", "sessions": v}));
     }
 }
 

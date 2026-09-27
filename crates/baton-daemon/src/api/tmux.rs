@@ -649,6 +649,12 @@ async fn frame_loop(name: String, tx: tokio::sync::mpsc::Sender<Bytes>) {
 
 const GET_SESSIONS_TTL: f64 = 2.0;
 
+/// The tmux session list as JSON for the `sessions_update` events (list
+/// group's `/api/events`), from the same 2 s cache as `/api/sessions`.
+pub async fn sessions_value() -> serde_json::Value {
+    serde_json::from_slice(&cached_get_sessions().await).unwrap_or_else(|_| serde_json::json!([]))
+}
+
 /// `_cached_get_sessions`: single-flight, 2 s TTL.
 async fn cached_get_sessions() -> Bytes {
     let mut cache = shared().sessions.lock().await;
