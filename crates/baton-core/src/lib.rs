@@ -4,8 +4,12 @@
 
 pub mod claude;
 pub mod codex;
+pub mod grouping;
+pub mod listbuild;
 pub mod pyfmt;
+pub mod pyjson;
 pub mod sessions;
+pub mod tmuxmap;
 
 use serde_json::Value;
 use std::collections::HashMap;
