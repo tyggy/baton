@@ -62,9 +62,11 @@ benchmarks show it at least as fast.
 **M0 — foundations (now)**
 - [x] Commit the evolution work (branches `baton-evolution` in the three current repos).
 - [x] Monorepo skeleton, license, plan.
-- [ ] `docs/api.md`: the API contract as the Python server implements it.
-- [ ] Slice 1 in Rust with the parity harness green.
-- [ ] CI: cargo test/clippy, parity harness on fixtures, Swift build.
+- [x] `docs/api.md`: the API contract as the Python server implements it.
+- [x] Slice 1 in Rust with the parity harness green (752/752 transcripts, 7.6x faster, incremental 84/84).
+- [x] CI: fmt, clippy, tests.
+- [ ] CI: parity on synthetic fixtures (real transcripts stay local), Swift build.
+- [ ] Push to GitHub (public repo).
 
 **M1 — daemon replaces the Python server on your Mac**
 - Slices 2–5, `baton serve` as the launchd service, proxy removed.
