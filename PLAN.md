@@ -84,6 +84,10 @@ benchmarks show it at least as fast.
 - iOS: QR pairing, demo mode (App Review + first run), HTTPS only.
 - TestFlight beta, 5–10 users.
 
+**Backlog (unscheduled)**
+- Themes: dark, light and custom themes that follow the macOS / iOS system
+  appearance (auto-switch), consistent across the iPhone app, Mac app and TUI.
+
 **M4 — public**
 - App Store; docs site; `baton.sh/install`.
 
