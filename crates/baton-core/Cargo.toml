@@ -8,3 +8,6 @@ repository.workspace = true
 
 [dependencies]
 serde_json.workspace = true
+regex = "1"
+md-5 = "0.10"
+libc = "0.2"
