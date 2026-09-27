@@ -32,13 +32,28 @@ impl State {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();
+        let (events, _) = tokio::sync::broadcast::channel(256);
         State {
             token: load_token(&home),
             dirs: Dirs::default_home(),
             home,
             tracker: Mutex::new(Tracker::new()),
             upstream,
+            events,
+            last_input_ms: AtomicU64::new(0),
         }
+    }
+
+    pub fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Record terminal input (tmux group calls this on scroll/send/send-key).
+    pub fn mark_input(&self) {
+        self.last_input_ms.store(Self::now_ms(), Ordering::Relaxed);
     }
 }
 
