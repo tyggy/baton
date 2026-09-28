@@ -260,12 +260,41 @@ pub fn fnmatch(name: &str, pat: &str) -> bool {
     rec(&n, &p)
 }
 
-fn scandir(dir: &Path) -> Vec<(String, PathBuf)> {
+/// One `os.scandir` entry: name, path, and the type from `d_type` (no
+/// stat; `None` when the platform didn't report it).
+struct Entry {
+    name: String,
+    path: PathBuf,
+    ft: Option<std::fs::FileType>,
+}
+
+impl Entry {
+    /// `DirEntry.is_dir()` (follows symlinks, like Python's default).
+    fn is_dir(&self) -> bool {
+        match self.ft {
+            Some(ft) if !ft.is_symlink() => ft.is_dir(),
+            _ => self.path.is_dir(),
+        }
+    }
+
+    fn is_symlink(&self) -> bool {
+        match self.ft {
+            Some(ft) => ft.is_symlink(),
+            None => std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.file_type().is_symlink()),
+        }
+    }
+}
+
+fn scandir(dir: &Path) -> Vec<Entry> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     rd.filter_map(|e| e.ok())
-        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+        .map(|e| Entry {
+            name: e.file_name().to_string_lossy().into_owned(),
+            path: e.path(),
+            ft: e.file_type().ok(),
+        })
         .collect()
 }
 
@@ -308,12 +337,12 @@ fn select(dir: &Path, parts: &[&str], out: &mut Vec<PathBuf>) {
         return;
     }
     if is_wildcard(pat) {
-        for (name, path) in scandir(dir) {
-            if !last && !path.is_dir() {
+        for e in scandir(dir) {
+            if !last && !e.is_dir() {
                 continue;
             }
-            if fnmatch(&name, pat) {
-                select(&path, &parts[1..], out);
+            if fnmatch(&e.name, pat) {
+                select(&e.path, &parts[1..], out);
             }
         }
     } else {
@@ -327,11 +356,9 @@ fn select(dir: &Path, parts: &[&str], out: &mut Vec<PathBuf>) {
 
 fn iterate_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
     out.push(dir.to_path_buf());
-    for (_, path) in scandir(dir) {
-        let is_dir = path.is_dir();
-        let is_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
-        if is_dir && !is_link {
-            iterate_dirs(&path, out);
+    for e in scandir(dir) {
+        if e.is_dir() && !e.is_symlink() {
+            iterate_dirs(&e.path, out);
         }
     }
 }
@@ -346,17 +373,16 @@ pub fn rglob(base: &Path, pattern: &str, first: bool) -> Vec<PathBuf> {
 
 fn rglob_into(dir: &Path, pattern: &str, first: bool, out: &mut Vec<PathBuf>) -> bool {
     let entries = scandir(dir);
-    for (name, path) in &entries {
-        if fnmatch(name, pattern) {
-            out.push(path.clone());
+    for e in &entries {
+        if fnmatch(&e.name, pattern) {
+            out.push(e.path.clone());
             if first {
                 return true;
             }
         }
     }
-    for (_, path) in &entries {
-        let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
-        if path.is_dir() && !is_link && rglob_into(path, pattern, first, out) {
+    for e in &entries {
+        if e.is_dir() && !e.is_symlink() && rglob_into(&e.path, pattern, first, out) {
             return true;
         }
     }

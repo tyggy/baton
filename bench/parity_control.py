@@ -208,10 +208,17 @@ def part_a(a, tmp):
                  "/api/browse", "/api/browse?dir=", f"/api/browse?dir={quote(str(fx / 'b.txt'))}",
                  "/api/browse?dir=/nonexistent-csm-bench-ctl", f"/api/browse?dir={quote(str(fx))}&q=f0",
                  f"/api/browse?dir={quote(str(fx))}&q=zzz-nomatch", "/api/browse?dir=~"]
+        # INC-040 (intended divergence): Python answers 500 for a file, a
+        # missing dir and `~`; the daemon answers 400 / 404 / the home listing.
+        diverge = {cases[4]: 400, cases[5]: 404, cases[8]: 200}
         for p in cases:
             sp, hp, bp = py(p)
             sr, hr, br = rs(p)
             rid = lambda b: re.sub(rb'"rid": "[0-9a-f]{8}"', b'"rid": "<rid>"', b)  # noqa: E731
+            if p in diverge and sp == 500:
+                check(f"browse {p.replace(str(fx), '<fx>')}: py 500 → daemon {diverge[p]} (INC-040)",
+                      sr == diverge[p] and "x-baton-daemon" not in hr, f"rs={sr} {br[:200]!r}")
+                continue
             check(f"browse {p.replace(str(fx), '<fx>')}: {sp}",
                   (sp, rid(bp)) == (sr, rid(br)) and "x-baton-daemon" not in hr,
                   f"py={sp} {bp[:200]!r}\n       rs={sr} {br[:200]!r}")

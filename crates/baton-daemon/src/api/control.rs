@@ -76,7 +76,6 @@ enum Ep {
     Pairing,
     Temp,
     Browse,
-    Orphans,
     EntityLogo,
     BenchJobGet,
     BenchJobs,
@@ -109,7 +108,6 @@ fn classify(method: &Method, path: &str) -> Option<Ep> {
             "/api/pairing" => Some(Ep::Pairing),
             "/api/temp" => Some(Ep::Temp),
             "/api/browse" => Some(Ep::Browse),
-            "/api/orphans" => Some(Ep::Orphans),
             "/api/entity-logo" => Some(Ep::EntityLogo),
             "/api/bench/job" if dev => Some(Ep::BenchJobGet),
             "/api/bench/jobs" if dev => Some(Ep::BenchJobs),
@@ -211,7 +209,6 @@ async fn dispatch(
         Ep::Pairing => Ok(pairing(state, h)),
         Ep::Temp => Ok(send_json(StatusCode::OK, &thermal().await, h)),
         Ep::Browse => browse(state, q, h).await,
-        Ep::Orphans => orphans(state, h).await,
         Ep::EntityLogo => entity_logo(state, q.get("id").map(String::as_str), h),
         Ep::BenchJobGet => Ok(bench_claim(peer, h)),
         Ep::BenchJobs => Ok(bench_list(h)),
@@ -556,126 +553,6 @@ fn list_dir(dir: &str) -> Result<Py, Fail> {
         })
         .collect();
     Ok(Py::List(out))
-}
-
-// ── /api/orphans ───────────────────────────────────────────────────────
-
-async fn orphans(state: &Arc<State>, h: &HeaderMap) -> HResult {
-    let o = cmd::run(
-        &[
-            "tmux",
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}\t#{pane_tty}\t#{session_activity}",
-        ],
-        3.0,
-    )
-    .await;
-    if o.rc != 0 {
-        return Ok(send_orphans(vec![], h));
-    }
-    let st = state.clone();
-    let known = tokio::task::spawn_blocking(move || {
-        let mut tracker = st.tracker.lock().unwrap_or_else(|p| p.into_inner());
-        let (sessions, _) = baton_core::sessions::build_all(&st.dirs, Some(&mut tracker));
-        sessions
-            .iter()
-            .filter_map(|s| s["id"].as_str().map(String::from))
-            .collect::<std::collections::HashSet<String>>()
-    })
-    .await
-    .map_err(|e| fail("RuntimeError", e.to_string(), "get_orphan_tmux_sessions"))?;
-
-    let tty_map = load_tty_map(&state.home.join(".claude/tty_session_map.json"));
-    let now = logs::unix_now();
-    let mut seen = std::collections::HashSet::new();
-    let mut out: Vec<(i64, Py)> = Vec::new();
-    for line in o.stdout.lines() {
-        let parts: Vec<&str> = strip(line).split('\t').collect();
-        if parts.len() != 3 {
-            continue;
-        }
-        let (name, tty, activity) = (parts[0], parts[1], parts[2]);
-        if !name.starts_with("claude-") || !seen.insert(name.to_string()) {
-            continue;
-        }
-        let mapped = tty_map.get(tty).cloned();
-        let orphan = match &mapped {
-            None => true,
-            Some(sid) => !known.contains(sid),
-        };
-        if !orphan {
-            continue;
-        }
-        let (act, age) = match strip(activity).parse::<i64>() {
-            Ok(a) => (a, (now - a as f64) as i64),
-            Err(_) => (0, 0),
-        };
-        out.push((
-            age,
-            Py::dict()
-                .with("tmux_name", name)
-                .with("mapped_session_id", mapped.clone())
-                .with(
-                    "reason",
-                    if mapped.is_none() {
-                        "no mapping"
-                    } else {
-                        "session not in catalog"
-                    },
-                )
-                .with("pane_activity_ts", act)
-                .with("idle_seconds", age),
-        ));
-    }
-    out.sort_by(|a, b| b.0.cmp(&a.0));
-    Ok(send_orphans(out.into_iter().map(|(_, v)| v).collect(), h))
-}
-
-fn send_orphans(list: Vec<Py>, h: &HeaderMap) -> Response<Body> {
-    let n = list.len();
-    send_json(
-        StatusCode::OK,
-        &Py::dict().with("orphans", Py::List(list)).with("count", n),
-        h,
-    )
-}
-
-/// `~/.claude/tty_session_map.json` entries younger than 7 days. Like the
-/// Python loop, a malformed entry stops the scan (its `except: pass`).
-fn load_tty_map(path: &Path) -> std::collections::HashMap<String, String> {
-    let mut out = std::collections::HashMap::new();
-    let Ok(data) = std::fs::read(path) else {
-        return out;
-    };
-    let Ok(Py::Dict(items)) = Py::loads(&data) else {
-        return out;
-    };
-    let now = logs::unix_now();
-    for (tty, info) in items {
-        if !info.is_dict() {
-            continue;
-        }
-        let ts = match info.get("ts") {
-            None => 0.0,
-            Some(Py::Int(i)) => *i as f64,
-            Some(Py::Float(f)) => *f,
-            Some(Py::Bool(b)) => *b as u8 as f64,
-            Some(_) => break,
-        };
-        if now - ts < 7.0 * 86400.0 {
-            if let Some(sid) = info.get("session_id").filter(|v| v.truthy()) {
-                match sid {
-                    Py::Str(s) => {
-                        out.insert(tty, s.clone());
-                    }
-                    _ => break, // unhashable/mismatched ids: Python's set lookup differs
-                }
-            }
-        }
-    }
-    out
 }
 
 // ── /api/entity-logo ───────────────────────────────────────────────────

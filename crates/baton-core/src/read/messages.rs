@@ -555,7 +555,7 @@ pub fn utf8_error_message(b: &[u8], e: &std::str::Utf8Error) -> String {
 pub fn parse_claude_lines<'a>(
     policy: &AssetPolicy,
     lines: impl IntoIterator<Item = &'a [u8]>,
-) -> Result<Vec<Value>, PyErr> {
+) -> Vec<Value> {
     let mut out = Vec::new();
     for raw in lines {
         let b = bstrip(raw);
@@ -565,12 +565,17 @@ pub fn parse_claude_lines<'a>(
         if !contains(b, b"\"type\":\"user\"") && !contains(b, b"\"type\":\"assistant\"") {
             continue;
         }
-        let Some(d) = loads_bytes(b)? else { continue };
-        if let Some(m) = claude_message(policy, &d)? {
+        // A line that isn't UTF-8 (INC-053) or whose record has the wrong
+        // shape (`"message": 123`, NEW-2) is skipped; Python failed the
+        // whole request with a 500.
+        let Ok(Some(d)) = loads_bytes(b) else {
+            continue;
+        };
+        if let Ok(Some(m)) = claude_message(policy, &d) {
             out.push(m);
         }
     }
-    Ok(out)
+    out
 }
 
 /// One parsed record → bubble message (or None).

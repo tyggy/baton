@@ -36,6 +36,31 @@ pub async fn route(_state: &Arc<State>, req: Request<Incoming>) -> Routed {
     let path = url_path(req.uri().path());
     let params = parse_qs(req.uri().query().unwrap_or(""));
     let headers = req.headers().clone();
+    // INC-048: ids are validated before any lookup (Python globbed them,
+    // so `*` / `a*` / `[a-f]*` served some other session). Ids with glob
+    // or path syntax → 400; other ids that can't name a session get
+    // Python's answer for an unknown id without a lookup.
+    for prefix in [
+        "/api/children/",
+        "/api/tail/",
+        "/api/session/",
+        "/api/messages/",
+    ] {
+        let Some(sid) = path.strip_prefix(prefix) else {
+            continue;
+        };
+        if core::valid_session_id(sid) {
+            break;
+        }
+        let resp = if sid.contains(['*', '?', '[', ']', '/', '\\']) {
+            send_json(400, &json!({"error": "invalid session id"}), &headers)
+        } else if prefix == "/api/children/" {
+            send_json(200, &json!({"id": sid, "children": []}), &headers)
+        } else {
+            send_json(404, &json!({"error": "session not found"}), &headers)
+        };
+        return Ok(resp);
+    }
     if let Some(sid) = path.strip_prefix("/api/children/") {
         return Ok(children(sid.to_string(), &headers).await);
     }
@@ -275,7 +300,6 @@ async fn messages(sid: String, limit: i64, req: &HeaderMap) -> Response<Body> {
                 send_json(500, &json!({"error": "session file unreadable"}), req)
             }
             core::MessagesErr::Error(msg) => send_json(500, &json!({"error": msg}), req),
-            core::MessagesErr::Crash => send_json(500, &core::internal_error(), req),
         },
         Some(Ok(Ok(m))) => match m.etag {
             None => send_json(200, &m.body, req),
@@ -426,10 +450,7 @@ fn tail(sid: String, since: Option<String>, from_start: bool, req: &HeaderMap) -
                     Err(_) => return,
                 };
                 offset = size;
-                let events = match core::tail_events(&mut pending, &chunk, codex) {
-                    Ok(ev) => ev,
-                    Err(_) => return,
-                };
+                let events = core::tail_events(&mut pending, &chunk, codex);
                 if !events.is_empty() {
                     if tx.send(Bytes::from(events)).await.is_err() {
                         return;

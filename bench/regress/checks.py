@@ -538,7 +538,7 @@ def path_param_fuzz(ctx):
              ("/api/pane/a%3Bb", None), ("/api/pane/bad%20name", None), ("/api/pane/..%2F..", None)]
     for path, inc in cases:
         r = ctx.c.get(path, timeout=10)
-        known = {BOTH: inc} if inc else None
+        known = {"python": inc} if inc else None  # daemon: ids validated (400)
         ctx.expect(0 < r.status < 500, f"GET {path} → {r.status or r.error}")
         ctx.expect(not _glob_leak(r) and not (r.status == 200 and "/pane/" in path),
                    f"GET {path} → {r.status} serves content ({r.body[:60]!r})", known=known)
@@ -547,7 +547,7 @@ def path_param_fuzz(ctx):
     s.ready.wait(5)
     time.sleep(0.5)
     s.close()
-    ctx.expect(s.status is not None and 400 <= s.status < 500, f"GET /api/tail/* → {s.status}", known={BOTH: "INC-048"})
+    ctx.expect(s.status is not None and 400 <= s.status < 500, f"GET /api/tail/* → {s.status}", known={"python": "INC-048"})
 
 
 @check("INC-040", mode=ANY, name="browse-errors")
@@ -556,7 +556,7 @@ def browse_errors(ctx):
     f = "/etc/hosts"
     for q, ok in (("/nonexistent-baton-regress", (404,)), (f, (400, 404)), ("~", (200, 400))):
         r = ctx.c.get(f"/api/browse?dir={quote(q)}", timeout=10)
-        ctx.expect(r.status in ok, f"browse {q} → {r.status} (want {ok})", known={BOTH: "INC-040"})
+        ctx.expect(r.status in ok, f"browse {q} → {r.status} (want {ok})", known={"python": "INC-040"})
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1051,7 +1051,12 @@ def malformed_record(ctx):
         ctx.expect(before <= after, f"rows lost: {[x[:8] for x in before - after]}")
         m = ctx.c.get(f"/api/messages/{I['CL_MALFORMED']}?limit=50")
         ctx.expect(m.status == 200, f"messages of the malformed transcript → {m.status} {m.body[:80]!r}",
-                   known={BOTH: "NEW-2 /api/messages 500 on a malformed record (not in the catalog)"})
+                   known={"python": "NEW-2 /api/messages 500 on a malformed record"})
+        ctx.expect(m.status == 200 and len((m.json() or {}).get("messages") or []) >= 10,
+                   "malformed transcript still lists its other messages", known={"python": "NEW-2"})
+        sp = ctx.c.get(f"/api/session/{I['CL_MALFORMED']}")
+        ctx.expect(sp.status == 200, f"session preview of the malformed transcript → {sp.status}",
+                   known={"python": "NEW-2 /api/session 500 on a malformed record"})
     finally:
         p.write_bytes(orig)
 
@@ -1062,7 +1067,7 @@ def messages_bad_utf8(ctx):
     I = ctx.world.ids
     r = ctx.c.get(f"/api/messages/{I['CL_BADUTF']}?limit=50")
     msgs = (r.json() or {}).get("messages") or []
-    ctx.expect(r.status == 200 and len(msgs) >= 10, f"/api/messages → {r.status}, {len(msgs)} messages", known={BOTH: "INC-053"})
+    ctx.expect(r.status == 200 and len(msgs) >= 10, f"/api/messages → {r.status}, {len(msgs)} messages", known={"python": "INC-053"})
     r = ctx.c.get(f"/api/session/{I['CL_BADUTF']}")
     ctx.expect(r.status == 200, f"/api/session → {r.status}")
 

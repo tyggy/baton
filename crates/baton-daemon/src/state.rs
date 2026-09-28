@@ -2,10 +2,8 @@
 #![allow(dead_code)] // fields are read by the group modules as they land
 
 use baton_core::sessions::Dirs;
-use baton_core::Tracker;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct State {
@@ -14,8 +12,6 @@ pub struct State {
     pub token: String,
     pub home: PathBuf,
     pub dirs: Dirs,
-    /// Incremental transcript parser shared by the list/read handlers.
-    pub tracker: Mutex<Tracker>,
     pub upstream: crate::proxy::Upstream,
     /// Live events for `/api/events` subscribers (served by the list group;
     /// tmux/control publish hook events, resume-ready, …). Payloads are the
@@ -40,7 +36,6 @@ impl State {
             token: load_token(&home),
             dirs: Dirs::default_home(),
             home,
-            tracker: Mutex::new(Tracker::new()),
             upstream,
             events,
             last_input_ms: AtomicU64::new(0),
