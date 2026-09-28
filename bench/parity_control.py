@@ -17,12 +17,19 @@ Part B — write endpoints, in two sandboxes that never touch the user's
     BATON_LOG_DIR / BATON_DEVICES_FILE pointing at temp files and
     BATON_SESSION_PREFIX=csm-bench-ctl-.
   Each sandbox has its own tmux server (TMUX_TMPDIR, $TMUX unset) whose
-  shell is /bin/sh, and PATH starts with stand-ins for `claude`, `codex`,
+  shell is /bin/sh; PATH starts with a tmux shim pinned to that server's
+  socket (-S: with only TMUX_TMPDIR, tmux falls back to the user's default
+  server when the dir is missing), then stand-ins for `claude`, `codex`,
   `osascript` (records the AppleScript instead of running it) and
   `whisper-cpp`. The same request script runs against both; responses,
   tmux state, files written, AppleScript, broadcast events and the
   request/error/client logs are compared after normalising session names,
   HOME, request ids and timestamps.
+
+Intended divergences (INTENDED below: the daemon implements the incident
+catalog's fix, Python still has the bug) are asserted as such rather than
+as identical: malformed / wrong-typed bodies are 400 not 500 (INC-041,
+INC-045), and a resume of an unknown id is 404 with no pane (INC-012).
 
 Exit code 1 on any mismatch. Everything created is removed at the end
 (tmux servers killed, temp dirs deleted) unless --keep.
@@ -48,6 +55,19 @@ SID = "11111111-2222-3333-4444-555555555555"
 
 FAILS = []
 PASSES = []
+
+# Intended divergences: the daemon implements the incident catalog's fix
+# (docs/incidents.md), Python still has the bug. label → (incident,
+# Python status, daemon status); the daemon's body must be a JSON error.
+INTENDED = {
+    "spawn bad json": ("INC-045", 500, 400),
+    "spawn list body": ("INC-045", 500, 400),
+    "spawn prompt non-str": ("INC-041", 500, 400),
+    "resume unknown": ("INC-012", 200, 404),
+    "respond key int": ("INC-041", 500, 400),
+    "hook-event list": ("INC-045", 500, 400),
+}
+UNKNOWN_SID = "deadbeef-0000"
 
 
 def check(name, ok, detail=""):
@@ -255,16 +275,24 @@ class Side:
         self.home = self.root / "home"
         self.tmuxdir = self.root / "t"
         self.osa = self.root / "osa"
-        for d in (self.home, self.tmuxdir, self.osa, self.home / "proj"):
+        self.shim = self.root / "shim"
+        for d in (self.home, self.tmuxdir, self.osa, self.home / "proj", self.shim):
             d.mkdir(parents=True, exist_ok=True)
+        real = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
+        (self.shim / "tmux").write_text(
+            "#!/bin/sh\n"
+            f'[ -d "{self.tmuxdir}" ] || {{ echo "parity: sandbox tmux dir gone, refusing" >&2; exit 97; }}\n'
+            f'exec "{real}" -S "{self.sock}" "$@"\n')
+        (self.shim / "tmux").chmod(0o755)
         self.proc = None
         self.events = None
+        self.crids = {}  # call label → X-Request-Id
 
     def env(self, fakes):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("TMUX", "CS_", "BATON_", "CSM_"))}
         env.update(HOME=str(self.home), TMUX_TMPDIR=str(self.tmuxdir), SHELL="/bin/sh",
-                   PATH=f"{fakes}:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
+                   PATH=f"{self.shim}:{fakes}:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
                    OSA_LOG=str(self.osa))
         return env
 
@@ -276,7 +304,7 @@ class Side:
         env = {k: v for k, v in os.environ.items() if not k.startswith("TMUX")}
         env["TMUX_TMPDIR"] = str(self.tmuxdir)
         env["SHELL"] = "/bin/sh"
-        return subprocess.run(["tmux", "-S", self.sock, *args], env=env, capture_output=True, text=True)
+        return subprocess.run([str(self.shim / "tmux"), *args], env=env, capture_output=True, text=True)
 
     @property
     def sock(self):
@@ -302,6 +330,7 @@ def run_script(side, logs_dir, devices_file):
         n[0] += 1
         h = dict(headers or {})
         h["X-Request-Id"] = f"{n[0]:08x}"
+        side.crids[label] = h["X-Request-Id"]
         st, hd, b = req(port, method, path, body=body, raw=raw, headers=h)
         obs.append((f"{label} → response", f"{st} {hd.get('content-type')} {side.norm(b)}"))
         return st, b
@@ -364,9 +393,9 @@ def run_script(side, logs_dir, devices_file):
     cal = json.loads((side.home / ".claude/resume_calibration.json").read_text())
     obs.append(("calibration records", str([(r["bytes"], "ms" in r) for r in cal["records"]])))
     call("resume again (reused)", "POST", "/api/resume", {"session_id": SID})
-    st, b = call("resume unknown", "POST", "/api/resume", {"session_id": "deadbeef-0000"})
+    st, b = call("resume unknown", "POST", "/api/resume", {"session_id": UNKNOWN_SID})
     r2 = jb(b).get("tmux_session")
-    obs.append(("resume unknown → tmux", side.norm(pane(r2, 0.8))))
+    obs.append(("resume unknown → tmux", side.norm(pane(r2, 0.8)) if r2 else "no pane"))
 
     # respond
     call("respond", "POST", "/api/respond", {"session": s1, "key": "y"})
@@ -454,7 +483,7 @@ def part_b(a, tmp):
     for s in (py, rs):  # each sandbox's tmux server, started with the sandbox env
         env = s.env(fakes)
         (s.tmuxdir / f"tmux-{os.getuid()}").mkdir(parents=True, mode=0o700, exist_ok=True)
-        subprocess.run(["tmux", "-S", s.sock, "-f", "/dev/null", "new-session", "-d", "-s", "csm-bench-ctl-keep"],
+        subprocess.run([str(s.shim / "tmux"), "-f", "/dev/null", "new-session", "-d", "-s", "csm-bench-ctl-keep"],
                        env=env, check=True)
     server = ("import sys; sys.path.insert(0, sys.argv[1]); import api_server as a; "
               "a.ThreadedHTTPServer(('127.0.0.1', 19886), a.APIHandler).serve_forever()")
@@ -477,12 +506,44 @@ def part_b(a, tmp):
         obs_py = run_script(py, py.home / "Library/Logs", py.home / ".config/baton/devices.json")
         obs_rs = run_script(rs, rs_logs, rs_devices)
         for (lp, vp), (lr, vr) in zip(obs_py, obs_rs):
-            check(lp, (lp, vp) == (lr, vr), f"py: {vp[:600]!r}\n       rs: {vr[:600]!r}")
+            detail = f"py: {vp[:600]!r}\n       rs: {vr[:600]!r}"
+            label = lp.removesuffix(" → response")
+            if lp.endswith(" → response") and label in INTENDED:
+                inc, st_py, st_rs = INTENDED[label]
+                body = vr.split(" ", 2)[2] if vr.count(" ") >= 2 else ""
+                try:
+                    err_ok = isinstance(json.loads(body).get("error"), str)
+                except Exception:
+                    err_ok = False
+                check(f"{lp}: Python {st_py}, daemon {st_rs} + JSON error ({inc}, intended)",
+                      vp.startswith(f"{st_py} ") and vr.startswith(f"{st_rs} ") and err_ok, detail)
+            elif lp == "resume unknown → tmux":
+                check(f"{lp}: Python spawned a pane, daemon none (INC-012, intended)",
+                      vp != "no pane" and vr == "no pane", detail)
+            elif lp == "tmux sessions after kill":
+                # Python's extra pane is the one its unknown-id resume spawned.
+                check(f"{lp}: same, plus Python's unknown-id pane (INC-012, intended)",
+                      vp.split().count("<S:>") == vr.split().count("<S:>") + 1
+                      and [x for x in vp.split() if x != "<S:>"] == [x for x in vr.split() if x != "<S:>"], detail)
+            elif lp == "osascript calls":
+                from collections import Counter
+                cp, cr = Counter(vp.split("\n----\n")), Counter(vr.split("\n----\n"))
+                extra = list((cp - cr).elements())
+                check(f"{lp}: same, plus Python's Terminal for the unknown-id pane (INC-012, intended)",
+                      not (cr - cp) and len(extra) == 1 and 'tmux attach -t <S:>"' in extra[0], detail)
+            else:
+                check(lp, (lp, vp) == (lr, vr), detail)
 
-        # broadcast events (compare as sets of canonical JSON, volatile fields dropped)
+        # broadcast events (compare as sets of canonical JSON, volatile fields
+        # dropped). Not compared: Python's events for its unknown-id resume
+        # (INC-012, the daemon answers 404), and `sessions_update` — the list
+        # group's tmux deltas on the daemon's shared bus, timing-dependent and
+        # not a control broadcast (already differing before fix/control).
         def canon(side):
             out = []
             for e in side.events.items:
+                if e.get("type") == "sessions_update" or e.get("claude_session_id") == UNKNOWN_SID:
+                    continue
                 e = {k: v for k, v in e.items() if k not in ("timestamp", "duration_ms")}
                 out.append(side.norm(json.dumps(e, sort_keys=True)))
             return sorted(out)
@@ -497,20 +558,27 @@ def part_b(a, tmp):
         rq_py = {r["crid"]: r for r in lines(py.home / "Library/Logs/cs-server.requests.jsonl") if r.get("crid")}
         rq_rs = {r["crid"]: r for r in lines(rs_logs / "cs-server.requests.jsonl") if r.get("crid")}
         keys_ok = all(list(r) == list(rq_py[c]) for c, r in rq_rs.items() if c in rq_py)
-        fields_ok = all((r["m"], py.norm(r["path"]), r["st"], r["gz"]) == (rq_py[c]["m"], py.norm(rq_py[c]["path"]), rq_py[c]["st"], rq_py[c]["gz"])
+        # Intended divergences: only the status differs, and it's the one
+        # INTENDED names.
+        diverging = {rs.crids[k]: v[2] for k, v in INTENDED.items()}
+        fields_ok = all((r["m"], py.norm(r["path"]), r["gz"]) == (rq_py[c]["m"], py.norm(rq_py[c]["path"]), rq_py[c]["gz"])
+                        and r["st"] == diverging.get(c, rq_py[c]["st"])
                         for c, r in rq_rs.items() if c in rq_py)
-        check(f"request log: {len(rq_rs)} lines, same keys/order and m/path/st/gz per crid",
+        check(f"request log: {len(rq_rs)} lines, same keys/order and m/path/st/gz per crid (st as INTENDED where it diverges)",
               len(rq_rs) == len(rq_py) and keys_ok and fields_ok,
               f"py={len(rq_py)} rs={len(rq_rs)} keys_ok={keys_ok} fields_ok={fields_ok}")
+        # Python logs an error for each of its INTENDED 500s; the daemon
+        # answers those with a 400 and logs none.
+        py_500s = sum(1 for v in INTENDED.values() if v[1] == 500)
         er_py = lines(py.home / "Library/Logs/cs-server.errors.jsonl")
         er_rs = lines(rs_logs / "cs-server.errors.jsonl")
-        check(f"error log: {len(er_rs)} entries, same keys/order",
-              len(er_py) == len(er_rs) and all(list(x) == list(y) for x, y in zip(er_py, er_rs)),
+        check(f"error log: {len(er_rs)} entries (Python {len(er_py)}, {py_500s} of them the intended 400s), same keys/order",
+              len(er_py) - py_500s == len(er_rs) and all(list(x) == list(y) for x, y in zip(er_py, er_rs)),
               f"py={[list(x) for x in er_py[:1]]} rs={[list(x) for x in er_rs[:1]]}")
         ev_py = [e for e in lines(py.home / "Library/Logs/cs-server.events.jsonl") if e["event"] == "request_error"]
         ev_rs = [e for e in lines(rs_logs / "cs-server.events.jsonl") if e["event"] == "request_error"]
-        check(f"events log: {len(ev_rs)} request_error, same keys",
-              len(ev_py) == len(ev_rs) and all(list(x) == list(y) for x, y in zip(ev_py, ev_rs)))
+        check(f"events log: {len(ev_rs)} request_error (Python {len(ev_py)}, {py_500s} of them the intended 400s), same keys",
+              len(ev_py) - py_500s == len(ev_rs) and all(list(x) == list(y) for x, y in zip(ev_py, ev_rs)))
         check("daemon wrote nothing under the sandbox HOME's real log dir",
               not (rs.home / "Library/Logs").exists())
     finally:

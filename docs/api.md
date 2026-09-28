@@ -16,6 +16,17 @@ the Rust daemon must keep it byte-compatible slice by slice (see PLAN.md).
   stay open (except streams).
 - **Errors:** JSON `{"error": "...", "rid": "..."}`; a crashed handler
   answers `500` if nothing was sent yet.
+- **POST bodies (daemon):** a JSON object, or empty (= `{}`). Invalid JSON,
+  invalid UTF-8, a non-object, or a field of the wrong type → `400
+  {"error": "..."}` naming the problem (Python answers `500` there,
+  INC-041/045). `/api/bench/*` bodies are checked the same way before the
+  daemon proxies them.
+- **tmux session names (daemon):** every endpoint that takes one
+  (`pane`, `pane-stream`, `scroll`, `send`, `send-key`, `respond`,
+  `kill-session`, voice's `X-Session`) requires `^[A-Za-z0-9._-]{1,200}$`
+  (else `400 invalid session name`) and targets it exactly (`=name`): a
+  missing session is `404 {"error": "no such session"}`, never another
+  session whose name starts the same (INC-049/050).
 
 ## Health
 
@@ -102,13 +113,34 @@ areas: {"<Area>": [Row]}}`. ETag + `If-None-Match` → `304`.
   size the pane (only if it differs; first frame held until settled). First
   event `event: dims\ndata: <cols>x<rows>`, then frames (full pane, ANSI).
 - `POST /api/scroll {session, direction: up|down, ticks}` — SGR wheel at the pane centre.
-- `POST /api/send {session, text}`, `POST /api/send-key {session, keys}`.
-- `POST /api/resume {id}`, `POST /api/spawn {…}`, `POST /api/kill-session {name}`.
+- `POST /api/send {session, message}`, `POST /api/send-key {session, keys}`
+  (`keys`: a string or a list; `key` is the single-key fallback). Missing
+  pane → `404` (daemon; Python: `500` / silent `200`).
+- `POST /api/spawn {…}`, `POST /api/kill-session {session}`.
+- `POST /api/resume {session_id}` → `{tmux_session, claude_session_id,
+  jsonl_bytes, estimated_ms}`. Daemon behaviour (INC-012/047):
+  - `session_id` must be `[A-Za-z0-9_-]`, ≤ 128 chars → else `400`;
+  - the origin comes from the transcript: `~/.claude/projects/*/<id>.jsonl`
+    → `claude --resume <id>` in `claude-<short>`; else a Codex rollout under
+    `~/.codex/sessions` → `codex resume <id>` in `codex-<short>` (rollout
+    cwd). Neither → `404 {"error": "unknown session"}`, nothing spawned;
+  - already running (the pane the live list maps to the id — process walk,
+    Codex tty / app-server cwd mapping — or a pane with the id's name that
+    has something running) → that pane, nothing typed (`reused` in the
+    `resume` event; Codex responses also carry `"reused": true`);
+  - a Codex session running on a terminal outside tmux → `409`;
+  - a pane with the id's name holding only an idle shell (the agent exited)
+    → the shell is replaced (`respawn-pane -k`) and the command started
+    there; the response has `"respawned": true`;
+  - Codex responses and events carry `"origin": "codex"`; Claude ones keep
+    Python's shape.
 - `GET /api/sessions` → tmux sessions with status (legacy list).
 
 ## Other
 
-`POST /api/respond`, `POST /api/voice`, `POST /api/paste-image`,
+`POST /api/respond`, `POST /api/voice` (daemon: no transcription backend →
+`503 {"error": "no transcription backend"}`, INC-039; Python `500` or a
+`200` whose "transcript" is the error), `POST /api/paste-image`,
 `POST /api/register-device`, `POST /api/hook-event`, `GET /api/browse`,
 `GET /api/temp`, `GET /api/plugins`, `GET /api/entity-logo`,
 `POST /api/client-metrics` (client timings, marks and error records).

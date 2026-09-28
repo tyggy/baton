@@ -24,6 +24,8 @@ from world import compact
 from core import ANY, SANDBOX, Skip, check, pct, port_open, spare_port, Client, wait_http, HOME
 
 BOTH = "*"
+# Fixed in the daemon (fix/control), still broken in Python.
+PY = "python"
 
 
 # ── helpers ─────────────────────────────────────────────────────────────
@@ -212,7 +214,7 @@ def _wait_argv(w, n0, secs=6):
 
 @check("INC-001,INC-012", mode=SANDBOX, name="resume-by-origin")
 def resume_by_origin(ctx):
-    """POST /api/resume runs `codex resume <id>` for a Codex id and `claude --resume <id>` (right cwd) for a Claude id; unknown id → 4xx, no pane."""
+    """POST /api/resume runs `codex resume <id>` (in `codex-<short>`, the rollout's cwd) for a Codex id and `claude --resume <id>` (right cwd) for a Claude id; a running Codex session returns its pane; unknown id → 404, no pane."""
     w, I = ctx.world, ctx.world.ids
     # Claude: the command and the cwd.
     n0 = len(w.argv())
@@ -228,24 +230,69 @@ def resume_by_origin(ctx):
     ctx.expect(r.status == 200, f"codex resume → 200 ({r.status} {r.body[:100]!r})")
     got = _wait_argv(w, n0)
     ctx.expect(any(p == "codex" and a == f"resume {I['CX_IDLE']}" for p, _, a in got),
-               f"codex resume ran `codex resume <id>` (got {[(p, a) for p, _, a in got]})", known={BOTH: "INC-012"})
-    ctx.expect(not any(p == "claude" for p, _, _ in got), "codex resume did not start claude", known={BOTH: "INC-012"})
+               f"codex resume ran `codex resume <id>` (got {[(p, a) for p, _, a in got]})", known={PY: "INC-012"})
+    ctx.expect(any(p == "codex" and cwd == str(w.proj) for p, cwd, _ in got),
+               "codex resume ran in the rollout's cwd", known={PY: "INC-012"})
+    ctx.expect(not any(p == "claude" for p, _, _ in got), "codex resume did not start claude", known={PY: "INC-012"})
+    ctx.expect((r.json() or {}).get("tmux_session") == "codex-" + I["CX_IDLE"][:8],
+               f"codex resume pane is codex-<short> (got {(r.json() or {}).get('tmux_session')!r})", known={PY: "INC-012"})
     # Codex id with a live pane: reuse, spawn nothing.
     n0, panes0 = len(w.argv()), set(w.pane_names())
     r = ctx.c.post("/api/resume", {"session_id": I["CX_RUN"]}, timeout=20)
     time.sleep(1.5)
     ctx.expect(r.status == 200 and (r.json() or {}).get("tmux_session") == w.panes["codex"],
                f"resume of a running Codex session returns its pane {w.panes['codex']} "
-               f"(got {r.status} {(r.json() or {}).get('tmux_session')!r})", known={BOTH: "INC-012"})
+               f"(got {r.status} {(r.json() or {}).get('tmux_session')!r})", known={PY: "INC-012"})
     ctx.expect(set(w.pane_names()) == panes0 and len(w.argv()) == n0,
-               "resume of a running Codex session spawns nothing", known={BOTH: "INC-012"})
+               "resume of a running Codex session spawns nothing", known={PY: "INC-012"})
+    # Bare `codex` mapped through the app-server (tty/cwd mapping): same.
+    n0, panes0 = len(w.argv()), set(w.pane_names())
+    r = ctx.c.post("/api/resume", {"session_id": I["CX_BARE"]}, timeout=20)
+    time.sleep(1.0)
+    ctx.expect(r.status == 200 and (r.json() or {}).get("tmux_session") == w.panes["codexbare"],
+               f"resume of a bare-codex session returns its pane {w.panes['codexbare']} "
+               f"(got {r.status} {(r.json() or {}).get('tmux_session')!r})", known={PY: "INC-012"})
+    ctx.expect(set(w.pane_names()) == panes0 and len(w.argv()) == n0,
+               "resume of a bare-codex session spawns nothing", known={PY: "INC-012"})
     # Unknown id → 4xx, no pane.
     panes0 = set(w.pane_names())
     r = ctx.c.post("/api/resume", {"session_id": "deadbeef-0000-4000-8000-000000000000"}, timeout=20)
     time.sleep(1.0)
-    ctx.expect(400 <= r.status < 500, f"unknown id → 4xx (got {r.status})", known={BOTH: "INC-012"})
+    ctx.expect(r.status == 404, f"unknown id → 404 (got {r.status})", known={PY: "INC-012"})
     ctx.expect(set(w.pane_names()) == panes0, f"unknown id spawns no pane (new: {set(w.pane_names()) - panes0})",
-               known={BOTH: "INC-012"})
+               known={PY: "INC-012"})
+
+
+@check("INC-012", mode=SANDBOX, name="resume-existing-pane")
+def resume_existing_pane(ctx):
+    """A pane named for the id that holds only an idle shell (the agent exited) is respawned with the resume command, not returned silently; one running something is returned as is and nothing is typed into it."""
+    w, I = ctx.world, ctx.world.ids
+    # Idle shell in claude-<short> (what an origin-blind resume leaves behind).
+    idle = "claude-" + I["CL_MD"][:8]
+    w.tmux("new-session", "-d", "-s", idle, "-c", str(w.proj), check=True)
+    time.sleep(0.5)
+    n0, panes0 = len(w.argv()), set(w.pane_names())
+    r = ctx.c.post("/api/resume", {"session_id": I["CL_MD"]}, timeout=20)
+    got = _wait_argv(w, n0)
+    ctx.expect(r.status == 200 and (r.json() or {}).get("tmux_session") == idle,
+               f"idle pane: resume answers with {idle} ({r.status} {r.body[:100]!r})")
+    ctx.expect(any(p == "claude" and a == f"--resume {I['CL_MD']}" for p, _, a in got),
+               f"idle pane: `claude --resume <id>` started in it (got {got})", known={PY: "INC-012"})
+    ctx.expect((r.json() or {}).get("respawned") is True, "idle pane: response says respawned", known={PY: "INC-012"})
+    ctx.expect(set(w.pane_names()) == panes0, f"idle pane: no extra pane (new: {set(w.pane_names()) - panes0})")
+    # Busy pane (something other than a shell prompt): returned, untouched.
+    busy = "claude-" + I["CL_HEADLESS"][:8]
+    w.tmux("new-session", "-d", "-s", busy, "-c", str(w.proj), "exec sleep 100000", check=True)
+    time.sleep(0.3)
+    before = w.tmux("capture-pane", "-p", "-t", "=" + busy + ":").stdout
+    n0, panes0 = len(w.argv()), set(w.pane_names())
+    r = ctx.c.post("/api/resume", {"session_id": I["CL_HEADLESS"]}, timeout=20)
+    time.sleep(1.0)
+    ctx.expect(r.status == 200 and (r.json() or {}).get("tmux_session") == busy,
+               f"busy pane: resume returns {busy} ({r.status} {r.body[:100]!r})")
+    ctx.expect(len(w.argv()) == n0 and set(w.pane_names()) == panes0, "busy pane: nothing spawned")
+    after = w.tmux("capture-pane", "-p", "-t", "=" + busy + ":").stdout
+    ctx.expect(after == before, f"busy pane: nothing typed into it ({after[-80:]!r})")
 
 
 @check("INC-047", mode=SANDBOX, name="resume-id-validation")
@@ -256,9 +303,9 @@ def resume_id_validation(ctx):
         n0, panes0 = len(w.argv()), set(w.pane_names())
         r = ctx.c.post("/api/resume", {"session_id": bad}, timeout=20)
         time.sleep(1.2)
-        ctx.expect(r.status == 400, f"resume {bad!r} → 400 (got {r.status})", known={BOTH: "INC-047"})
+        ctx.expect(r.status == 400, f"resume {bad!r} → 400 (got {r.status})", known={PY: "INC-047"})
         ctx.expect(set(w.pane_names()) == panes0 and len(w.argv()) == n0,
-                   f"resume {bad!r} spawned nothing (new panes {set(w.pane_names()) - panes0})", known={BOTH: "INC-047"})
+                   f"resume {bad!r} spawned nothing (new panes {set(w.pane_names()) - panes0})", known={PY: "INC-047"})
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -419,13 +466,15 @@ TYPE_FUZZ = {
 }
 
 # Python's read_body() json.loads an invalid body and dies → 500 on every
-# JSON endpoint (INC-045); `body.get` on a non-object → 500 likewise.
-# The daemon answers these byte-for-byte like Python (same 500), although
-# the catalog asks it to answer 4xx — so they're known on both.
-PY_BODY_BUG = {BOTH: "INC-045"}
+# JSON endpoint (INC-045); `body.get` on a non-object → 500 likewise. The
+# daemon parses every POST body with one parser (http.rs) and answers 400
+# with a JSON error — including /api/bench/*, which it validates before
+# proxying when not in --dev.
+PY_BODY_BUG = {PY: "INC-045"}
 # INC-041 names scroll/send-key; the same `body.get(...).strip()` pattern
-# 500s on every endpoint below (both impls).
-KNOWN_TYPE = {k: {BOTH: "INC-041"} for k in [
+# 500s on every endpoint below in Python. The daemon's typed field access
+# makes each a 400.
+KNOWN_TYPE = {k: {PY: "INC-041"} for k in [
     ("/api/scroll", "session:int"), ("/api/scroll", "direction:int"),
     ("/api/send-key", "keys:int"), ("/api/send-key", "session:list"),
     ("/api/send", "session:int"), ("/api/send", "message:int"),
@@ -442,7 +491,8 @@ def post_fuzz(ctx):
         for label, raw in BAD_BODIES:
             r = ctx.c.request("POST", ep, raw=raw, headers={"Content-Type": "application/json"}, timeout=10)
             seen.append((ep, label, r.status))
-            ctx.expect(0 < r.status < 500, f"{ep} {label} → {r.status or r.error}", known=PY_BODY_BUG)
+            ctx.expect(r.status == 400 and isinstance((r.json() or {}).get("error"), str),
+                       f"{ep} {label} → {r.status or r.error} (want 400 with a JSON error)", known=PY_BODY_BUG)
         for label, body in TYPE_FUZZ.get(ep, []):
             r = ctx.c.post(ep, body, timeout=10)
             seen.append((ep, label, r.status))
@@ -821,7 +871,7 @@ def input_targeting(ctx):
                      ("/api/send-key", {"session": gone, "keys": ["Up"]})):
         r = ctx.c.post(ep, body)
         ctx.expect(r.status == 404 and r.ms < 100, f"{ep} to a missing pane → {r.status} in {r.ms:.0f} ms (want 404 < 100 ms)",
-                   known={BOTH: "INC-031" if ep == "/api/scroll" else "INC-015"})
+                   known={PY: "INC-031" if ep == "/api/scroll" else "INC-015"})
     # prefix mis-targeting: csm-bench-a doesn't exist, csm-bench-ab does
     n0 = nlines(w.app_log["ab"])
     for ep, body in (("/api/scroll", {"session": "csm-bench-a", "direction": "up", "ticks": 1}),
@@ -830,18 +880,19 @@ def input_targeting(ctx):
         r = ctx.c.post(ep, body)
         time.sleep(0.4)
         leaked = nlines(w.app_log["ab"]) > n0
-        ctx.expect(not leaked, f"{ep} to csm-bench-a didn't reach csm-bench-ab ({r.status})", known={BOTH: "INC-050"})
-        ctx.expect(r.status == 404, f"{ep} to csm-bench-a → {r.status} (want 404)", known={BOTH: "INC-050"})
+        ctx.expect(not leaked, f"{ep} to csm-bench-a didn't reach csm-bench-ab ({r.status})", known={PY: "INC-050"})
+        ctx.expect(r.status == 404, f"{ep} to csm-bench-a → {r.status} (want 404)", known={PY: "INC-050"})
         n0 = nlines(w.app_log["ab"])
     r = ctx.c.get("/api/pane/csm-bench-a")
-    ctx.expect(r.status == 404, f"/api/pane/csm-bench-a → {r.status} (want 404, not csm-bench-ab's screen)", known={BOTH: "INC-050"})
+    ctx.expect(r.status == 404, f"/api/pane/csm-bench-a → {r.status} (want 404, not csm-bench-ab's screen)", known={PY: "INC-050"})
     # unsafe names
     for ep, body in (("/api/scroll", {"session": "a;b", "direction": "up"}),
                      ("/api/send", {"session": "a;b", "message": "x"}),
                      ("/api/send-key", {"session": "a;b", "keys": ["Up"]}),
-                     ("/api/kill-session", {"session": "a;b"})):
+                     ("/api/kill-session", {"session": "a;b"}),
+                     ("/api/respond", {"session": "a;b"})):
         r = ctx.c.post(ep, body)
-        known = {BOTH: "INC-049"} if ep in ("/api/send", "/api/send-key") else None
+        known = {PY: "INC-049"} if ep in ("/api/send", "/api/send-key", "/api/respond") else None
         ctx.expect(r.status == 400, f"{ep} session 'a;b' → {r.status} (want 400)", known=known)
 
 
@@ -1095,8 +1146,16 @@ def voice_no_backend(ctx):
         (1).to_bytes(2, "little") + (1).to_bytes(2, "little") + (16000).to_bytes(4, "little") + \
         (32000).to_bytes(4, "little") + (2).to_bytes(2, "little") + (16).to_bytes(2, "little") + b"data" + \
         (32000).to_bytes(4, "little") + b"\0" * 32000
+    # The sandbox has no Groq/OpenAI key and CS_MLX_PYTHON points nowhere
+    # (world.env); a working whisper-cpp / whisper on PATH would transcribe.
+    if subprocess.run(["which", "whisper-cpp"], capture_output=True, env=ctx.world.env()).returncode == 0:
+        raise Skip("whisper-cpp on the sandbox PATH: a backend exists")
     r = ctx.c.request("POST", "/api/voice", raw=wav, headers={"Content-Type": "audio/wav"}, timeout=60)
-    ctx.expect(r.status != 500 and r.status != 0, f"/api/voice → {r.status} {r.body[:80]!r}", known={BOTH: "INC-039"})
+    ctx.expect(r.status == 503 and (r.json() or {}).get("error") == "no transcription backend",
+               f"/api/voice → {r.status} {r.body[:80]!r} (want 503 no transcription backend)", known={PY: "INC-039"})
+    # An unsafe X-Session is rejected before anything is transcribed or typed.
+    r = ctx.c.request("POST", "/api/voice", raw=wav, headers={"Content-Type": "audio/wav", "X-Session": "a;b"}, timeout=60)
+    ctx.expect(r.status == 400, f"/api/voice X-Session 'a;b' → {r.status}", known={PY: "INC-049"})
 
 
 @check("INC-043", mode=SANDBOX, name="kill-missing")
@@ -1151,3 +1210,23 @@ def orphans_fast(ctx):
         ctx.require(r.status == 200, f"/api/orphans → {r.status}")
         ms.append(r.ms)
     ctx.expect(max(ms) < 1000, f"/api/orphans warm: {[round(x) for x in ms]} ms")
+
+
+@check("INC-049", mode=SANDBOX, name="tmux-arg-separator")
+def tmux_arg_separator(ctx):
+    """A key or message ending in `;` reaches the pane literally: tmux reads a trailing `;` as a command separator, so send-key ["x;", "kill-server"] must not run kill-server."""
+    if ctx.impl == "python":
+        # Python passes the argument through: this would kill the sandbox
+        # tmux server and take the rest of the run with it.
+        raise Skip("python: known to split on a trailing ';' (INC-049); not run")
+    w = ctx.world
+    pane, log = w.panes["send"], w.app_log["send"]
+    n0 = nlines(log)
+    r = ctx.c.post("/api/send-key", {"session": pane, "keys": ["x;", "kill-server"]})
+    ctx.expect(r.status == 200, f"send-key → {r.status} {r.body[:80]!r}")
+    r = ctx.c.post("/api/send", {"session": pane, "message": "tail;"})
+    ctx.expect(r.status == 200, f"send → {r.status} {r.body[:80]!r}")
+    time.sleep(0.6)
+    ctx.expect(w.panes["seq"] in w.pane_names(), "sandbox tmux server still up")
+    data = b"".join(bytes.fromhex(l) for l in Path(log).read_text().splitlines()[n0:] if l)
+    ctx.expect(b"x;kill-server" in data and b"tail;" in data, f"pane got the text literally ({data[-60:]!r})")

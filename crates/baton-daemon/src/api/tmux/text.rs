@@ -1,21 +1,9 @@
 //! Pure text helpers for the tmux group — each mirrors a Python function in
 //! `api_server.py` byte for byte (frame transforms, status detection,
 //! `int()` parsing, `json.dumps` formatting, the AppleScript sources).
+//! Session-name validation lives in `crate::tmux_target`.
 
 use baton_core::pyfmt::{is_space, strip};
-
-/// `_is_safe_tmux_name`: `^[A-Za-z0-9._-]+$`, at most 200 code points.
-/// (Python's `$` also matches before one trailing `\n`.)
-pub fn is_safe_tmux_name(name: &str) -> bool {
-    if name.is_empty() || name.chars().count() > 200 {
-        return false;
-    }
-    let body = name.strip_suffix('\n').unwrap_or(name);
-    !body.is_empty()
-        && body
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
 
 /// Python `int(s)` for a string: surrounding whitespace, optional sign,
 /// ASCII digits with single `_` between digits. `None` = ValueError.
@@ -370,31 +358,6 @@ pub fn write_str(out: &mut String, s: &str) {
     out.push('"');
 }
 
-/// Python `str(v)` for a JSON-decoded value (send-key arguments).
-pub fn py_str(v: &serde_json::Value) -> String {
-    use serde_json::Value;
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Null => "None".into(),
-        Value::Bool(b) => (if *b { "True" } else { "False" }).into(),
-        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
-            (Some(i), _, _) => i.to_string(),
-            (_, Some(u), _) => u.to_string(),
-            (_, _, Some(f)) => py_float_repr(f),
-            _ => n.to_string(),
-        },
-        other => other.to_string(),
-    }
-}
-
-fn py_float_repr(f: f64) -> String {
-    if f.is_finite() && f == f.trunc() && f.abs() < 1e16 {
-        format!("{f:.1}")
-    } else {
-        format!("{f}")
-    }
-}
-
 // ── AppleScript sources ───────────────────────────────────────────────────
 
 /// `_resize_terminal_app_window` script.
@@ -414,20 +377,6 @@ pub fn focus_tab_script(tty: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn safe_names() {
-        assert!(is_safe_tmux_name("claude-1d693e35"));
-        assert!(is_safe_tmux_name("a.b_c-d"));
-        assert!(is_safe_tmux_name("abc\n"));
-        assert!(!is_safe_tmux_name(""));
-        assert!(!is_safe_tmux_name("\n"));
-        assert!(!is_safe_tmux_name("a b"));
-        assert!(!is_safe_tmux_name("a;b"));
-        assert!(!is_safe_tmux_name("é"));
-        assert!(!is_safe_tmux_name(&"a".repeat(201)));
-        assert!(is_safe_tmux_name(&"a".repeat(200)));
-    }
 
     #[test]
     fn ints() {

@@ -191,7 +191,9 @@ class World:
         env.update(HOME=str(self.home), TMUX_TMPDIR=str(self.tdir), SHELL="/bin/sh",
                    TMPDIR=str(self.root) + "/", PYTHONDONTWRITEBYTECODE="1",
                    PATH=f"{self.fakes}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-                   BATON_DISABLE_CLASSIFY="1", REGRESS_ARGV_LOG=str(self.argv_log), HISTFILE="/dev/null")
+                   BATON_DISABLE_CLASSIFY="1", REGRESS_ARGV_LOG=str(self.argv_log), HISTFILE="/dev/null",
+                   # no mlx-whisper backend (it would download a model into the sandbox HOME)
+                   CS_MLX_PYTHON=str(self.root / "no-mlx-python"))
         # Python's `markdown` lives in the user site-packages, which Python
         # finds through HOME; keep it visible with the sandbox HOME.
         ub = HOME / "Library/Python/3.11"

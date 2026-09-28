@@ -5,11 +5,17 @@
 //!
 //! Parity reference: claude-session-manager/server/api_server.py — bodies,
 //! status codes, files written and events broadcast match it byte for byte
-//! (JSON through `pyjson`, Python's encoding). Not native here:
+//! (JSON through `pyjson`, Python's encoding), except where the incident
+//! catalog (docs/incidents.md) asks for the fix: malformed bodies and wrong
+//! field types are 400 (INC-041/045), tmux targets are exact and validated
+//! (INC-049/050), `/api/resume` resumes by origin and rejects unknown or
+//! glob-like ids (INC-012/047), and voice without a backend is 503
+//! (INC-039). Not native here:
 //! `/api/plugins` and `/api/plugin/*` (plugins are Python modules the
 //! reference server imports), `/api/entity-logo` when the entity catalog
 //! must be refreshed or an Airtable image fetched, and `/api/bench/*`
-//! unless the daemon runs with `--dev`.
+//! unless the daemon runs with `--dev` (the POSTs are still validated here
+//! first, so a malformed one is a 400 rather than Python's 500).
 //!
 //! Environment (tests point these at a sandbox): `HOME` (lineage, pastes,
 //! calibration, classifications, catalog), `BATON_LOG_DIR`,
@@ -18,11 +24,12 @@
 
 use super::Routed;
 use crate::cmd;
-use crate::http::bytes_response;
+use crate::http::{self, bytes_response, BadRequest, Fields};
 use crate::logs::{self, RequestLog};
 use crate::proxy::Body;
 use crate::pyjson::{head, Py, Style};
 use crate::state::State;
+use crate::tmux_target as target;
 use baton_core::pyfmt::strip;
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -35,19 +42,29 @@ use std::time::{Duration, Instant, SystemTime};
 pub const API_VERSION: u64 = 1;
 pub const MIN_CLIENT: u64 = 1;
 
-/// A handler failure Python would have raised → 500 `internal error`.
 #[derive(Debug)]
-struct Fail {
-    typ: &'static str,
-    msg: String,
-    at: &'static str,
+enum Fail {
+    /// A handler failure Python would have raised → 500 `internal error`.
+    Internal {
+        typ: &'static str,
+        msg: String,
+        at: &'static str,
+    },
+    /// The request is unusable (body, field types) → 400 with the reason.
+    Bad(BadRequest),
 }
 
 fn fail(typ: &'static str, msg: impl Into<String>, at: &'static str) -> Fail {
-    Fail {
+    Fail::Internal {
         typ,
         msg: msg.into(),
         at,
+    }
+}
+
+impl From<BadRequest> for Fail {
+    fn from(b: BadRequest) -> Self {
+        Fail::Bad(b)
     }
 }
 
@@ -75,6 +92,8 @@ enum Ep {
     ClientMetrics,
     BenchJobPost,
     BenchDone,
+    /// `/api/bench/{job,done}` without `--dev`: validated, then proxied.
+    BenchProxy,
 }
 
 fn dev_mode() -> bool {
@@ -111,6 +130,7 @@ fn classify(method: &Method, path: &str) -> Option<Ep> {
             "/api/client-metrics" => Some(Ep::ClientMetrics),
             "/api/bench/job" if dev => Some(Ep::BenchJobPost),
             "/api/bench/done" if dev => Some(Ep::BenchDone),
+            "/api/bench/job" | "/api/bench/done" => Some(Ep::BenchProxy),
             _ => None,
         };
     }
@@ -124,6 +144,9 @@ pub async fn route(state: &Arc<State>, req: Request<Incoming>) -> Routed {
     let q = parse_qs(req.uri().query());
     if ep == Ep::EntityLogo && !logo_is_local(state, q.get("id").map(String::as_str)) {
         return Err(req); // catalog refresh / Airtable fetch stay in Python
+    }
+    if ep == Ep::BenchProxy {
+        return Ok(bench_proxy(state, req).await);
     }
     let log = RequestLog::begin(&req);
     let path = req.uri().path().to_string();
@@ -141,23 +164,21 @@ pub async fn route(state: &Arc<State>, req: Request<Incoming>) -> Routed {
     let res = dispatch(state, ep, req, &q, &headers, peer).await;
     let resp = match res {
         Ok(r) => r,
-        Err(f) => {
+        Err(Fail::Bad(b)) => b.response(&headers),
+        Err(Fail::Internal { typ, msg, at }) => {
             logs::event(
                 "request_error",
                 vec![
                     ("rid", Py::str(log.rid.as_str())),
                     ("path", Py::str(path.as_str())),
-                    (
-                        "error",
-                        Py::str(head(&format!("{}({:?})", f.typ, f.msg), 300)),
-                    ),
+                    ("error", Py::str(head(&format!("{typ}({msg:?})"), 300))),
                 ],
             );
             logs::error(
                 "request",
-                f.typ,
-                &f.msg,
-                vec![format!("control.rs:0 {}", f.at)],
+                typ,
+                &msg,
+                vec![format!("control.rs:0 {at}")],
                 vec![
                     ("rid", Py::str(log.rid.as_str())),
                     ("method", Py::str(method.as_str())),
@@ -197,8 +218,9 @@ async fn dispatch(
         Ep::BenchEvents => Ok(events_tap(state)),
         Ep::PasteImage => paste_image(state, req, h).await,
         Ep::Voice => voice(state, req, h).await,
+        Ep::BenchProxy => unreachable!("proxied in route"),
         _ => {
-            let body = read_body(req, h).await?;
+            let body = http::read_object(req).await?;
             match ep {
                 Ep::Spawn => spawn(state, body, h).await,
                 Ep::Resume => resume(state, body, h).await,
@@ -229,38 +251,6 @@ fn send_json(status: StatusCode, v: &Py, h: &HeaderMap) -> Response<Body> {
 
 fn err_json(status: StatusCode, msg: &str, h: &HeaderMap) -> Response<Body> {
     send_json(status, &Py::dict().with("error", msg), h)
-}
-
-fn content_length(h: &HeaderMap) -> Result<i64, Fail> {
-    match h.get("content-length").and_then(|v| v.to_str().ok()) {
-        None | Some("") => Ok(0),
-        Some(s) => strip(s).parse::<i64>().map_err(|_| {
-            fail(
-                "ValueError",
-                format!("invalid literal for int() with base 10: '{s}'"),
-                "read_body",
-            )
-        }),
-    }
-}
-
-async fn raw_body(req: Request<Incoming>) -> Vec<u8> {
-    req.into_body()
-        .collect()
-        .await
-        .map(|c| c.to_bytes().to_vec())
-        .unwrap_or_default()
-}
-
-/// `read_body`: `{}` without a Content-Length, else `json.loads`.
-async fn read_body(req: Request<Incoming>, h: &HeaderMap) -> Result<Py, Fail> {
-    let n = content_length(h)?;
-    let data = raw_body(req).await;
-    if n == 0 {
-        return Ok(Py::dict());
-    }
-    let take = (n.max(0) as usize).min(data.len());
-    Py::loads(&data[..take]).map_err(|e| fail("JSONDecodeError", e, "read_body"))
 }
 
 /// `urllib.parse.parse_qs` first values (blank values dropped).
@@ -305,24 +295,7 @@ fn unquote_plus(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// `body.get(key, default)` that must be a str (Python calls `.strip()` or
-/// passes it to a subprocess).
-fn get_str(body: &Py, key: &str, default: &str, at: &'static str) -> Result<String, Fail> {
-    if !body.is_dict() {
-        return Err(no_get(body, at));
-    }
-    match body.get(key) {
-        None => Ok(default.to_string()),
-        Some(Py::Str(s)) => Ok(s.clone()),
-        Some(v) => Err(fail(
-            "AttributeError",
-            format!("'{}' object has no attribute 'strip'", v.type_name()),
-            at,
-        )),
-    }
-}
-
-/// `(body.get(key) or "").strip()`.
+/// `(d.get(key) or "").strip()` on a local JSON file (classifications).
 fn get_str_or_empty(body: &Py, key: &str, at: &'static str) -> Result<String, Fail> {
     match body.get(key) {
         Some(v) if v.truthy() => match v {
@@ -343,29 +316,6 @@ fn no_get(body: &Py, at: &'static str) -> Fail {
         format!("'{}' object has no attribute 'get'", body.type_name()),
         at,
     )
-}
-
-fn require_dict(body: &Py, at: &'static str) -> Result<(), Fail> {
-    if body.is_dict() {
-        Ok(())
-    } else {
-        Err(no_get(body, at))
-    }
-}
-
-/// A value handed to `subprocess` must be a str.
-fn arg_str(v: &Py, at: &'static str) -> Result<String, Fail> {
-    match v {
-        Py::Str(s) => Ok(s.clone()),
-        other => Err(fail(
-            "TypeError",
-            format!(
-                "expected str, bytes or os.PathLike object, not {}",
-                other.type_name()
-            ),
-            at,
-        )),
-    }
 }
 
 fn broadcast(state: &State, ev: Py) {
@@ -398,23 +348,15 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// `_is_safe_tmux_name`.
-fn is_safe_tmux_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.chars().count() <= 200
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
-
 async fn tmux_apply_options(name: &str) {
+    let t = target::pane(name);
     for (opt, val) in [
         ("status", "off"),
         ("mouse", "on"),
         ("copy-command", "pbcopy"),
         ("window-size", "latest"),
     ] {
-        cmd::run(&["tmux", "set-option", "-t", name, opt, val], 3.0).await;
+        cmd::run(&["tmux", "set-option", "-t", &t, opt, val], 3.0).await;
     }
 }
 
@@ -828,14 +770,14 @@ fn entity_logo(state: &State, id: Option<&str>, h: &HeaderMap) -> HResult {
 // ── /api/spawn ─────────────────────────────────────────────────────────
 
 async fn spawn(state: &Arc<State>, body: Py, h: &HeaderMap) -> HResult {
-    require_dict(&body, "spawn")?;
-    let cwd_raw = match body.get("cwd") {
-        Some(v) if v.truthy() => arg_str(v, "spawn")?,
-        _ => "~".to_string(),
+    let f = Fields(&body);
+    let cwd_raw = match f.str("cwd")? {
+        Some(c) if !c.is_empty() => c,
+        _ => "~",
     };
-    let cwd = expanduser(&cwd_raw, home(state));
-    let prompt = strip(&get_str(&body, "prompt", "", "spawn")?).to_string();
-    let model = body.get("model").cloned().unwrap_or(Py::None);
+    let cwd = expanduser(cwd_raw, home(state));
+    let prompt = strip(f.str_or("prompt", "")?).to_string();
+    let model = f.str_or("model", "")?;
     let open_terminal = body.get("open_terminal").is_none_or(Py::truthy);
     let name = format!("{}{}", session_prefix(), logs::rand_hex(8));
 
@@ -854,22 +796,33 @@ async fn spawn(state: &Arc<State>, body: Py, h: &HeaderMap) -> HResult {
     }
     tmux_apply_options(&name).await;
     let line = if !prompt.is_empty() {
-        let model_part = if model.truthy() {
-            format!(" --model {}", model.py_str())
+        let model_part = if !model.is_empty() {
+            format!(" --model {model}")
         } else {
             String::new()
         };
         format!("claude{model_part} -p {}", sh_quote(&prompt))
-    } else if model.truthy() {
-        format!("claude --model {}", model.py_str())
+    } else if !model.is_empty() {
+        format!("claude --model {model}")
     } else {
         "claude".to_string()
     };
-    cmd::run(&["tmux", "send-keys", "-t", &name, &line, "Enter"], 3.0).await;
+    cmd::run(
+        &[
+            "tmux",
+            "send-keys",
+            "-t",
+            &target::pane(&name),
+            &target::literal(&line),
+            "Enter",
+        ],
+        3.0,
+    )
+    .await;
     if open_terminal {
         cmd::popen(&["osascript", "-e", &osa_open_attached(&name, &name)]);
     }
-    let body_parent = get_str_or_empty(&body, "parent_id", "spawn")?;
+    let body_parent = strip(f.str_or("parent_id", "")?).to_string();
     let header_parent = h
         .get("x-spawned-by")
         .and_then(|v| v.to_str().ok())
@@ -878,7 +831,7 @@ async fn spawn(state: &Arc<State>, body: Py, h: &HeaderMap) -> HResult {
     let parent: Option<String> = [body_parent, header_parent]
         .into_iter()
         .find(|s| !s.is_empty());
-    let kind = get_str_or_empty(&body, "spawn_kind", "spawn")?;
+    let kind = strip(f.str_or("spawn_kind", "")?).to_string();
     let kind = if !kind.is_empty() {
         kind
     } else if parent.is_some() {
@@ -1104,148 +1057,446 @@ fn haiku_title_for(home: &Path, session_id: &str) -> Result<String, Fail> {
     })
 }
 
+/// Resume ids are Claude / Codex session ids (UUIDs, `agent-…`). A strict
+/// charset means an id can never act as a glob or a path (INC-047).
+fn is_valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !id.starts_with('-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Origin {
+    Claude,
+    Codex,
+}
+
+/// Which agent wrote the session (INC-012): a Claude transcript under
+/// `~/.claude/projects` wins, else a Codex rollout under `~/.codex/sessions`.
+fn locate_transcript(home: &Path, id: &str) -> Option<(Origin, PathBuf)> {
+    if let Some(p) = find_session_jsonl(&home.join(".claude/projects"), id) {
+        return Some((Origin::Claude, p));
+    }
+    find_codex_rollout(&home.join(".codex/sessions"), id).map(|p| (Origin::Codex, p))
+}
+
+/// `<root>/YYYY/MM/DD/rollout-<ts>-<id>.jsonl`, newest directory first.
+fn find_codex_rollout(root: &Path, id: &str) -> Option<PathBuf> {
+    fn walk(dir: &Path, depth: u8, suffix: &str) -> Option<PathBuf> {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        entries.sort_unstable_by(|a, b| b.cmp(a));
+        for p in entries {
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
+            let Some(name) = name.filter(|n| !n.starts_with('.')) else {
+                continue;
+            };
+            if p.is_dir() {
+                if depth < 3 {
+                    if let Some(f) = walk(&p, depth + 1, suffix) {
+                        return Some(f);
+                    }
+                }
+            } else if name.starts_with("rollout-") && name.ends_with(suffix) {
+                return Some(p);
+            }
+        }
+        None
+    }
+    walk(root, 0, &format!("-{id}.jsonl"))
+}
+
+/// The rollout's `session_meta.payload.cwd`, when that directory exists.
+fn codex_cwd(rollout: &Path, home: &Path) -> Option<String> {
+    use std::io::{BufRead, Read};
+    let mut line = Vec::new();
+    std::io::BufReader::new(std::fs::File::open(rollout).ok()?.take(1 << 20))
+        .read_until(b'\n', &mut line)
+        .ok()?;
+    let rec = Py::loads(&line).ok()?;
+    let cwd = rec.get("payload")?.get("cwd")?.as_str()?;
+    let cwd = expanduser(cwd, home);
+    Path::new(&cwd).is_dir().then_some(cwd)
+}
+
+/// What an existing tmux session named for this id holds.
+#[derive(Debug, PartialEq, Eq)]
+enum PaneState {
+    Missing,
+    /// Something runs in it (the agent, or anything else): reuse, send nothing.
+    Busy,
+    /// Only a shell at its prompt (the agent exited), or a dead pane.
+    Idle,
+}
+
+const SHELLS: [&str; 9] = [
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu",
+];
+
+/// Idle means: the pane's first process is a shell, it owns the terminal's
+/// foreground, and it has no children. Anything unclear counts as busy, so
+/// the only pane ever respawned is one with nothing in it to lose.
+async fn pane_state(name: &str) -> PaneState {
+    if !cmd::run(&["tmux", "has-session", "-t", &target::session(name)], 3.0)
+        .await
+        .ok()
+    {
+        return PaneState::Missing;
+    }
+    let o = cmd::run(
+        &[
+            "tmux",
+            "display-message",
+            "-p",
+            "-t",
+            &target::pane(name),
+            "#{pane_pid} #{pane_dead}",
+        ],
+        3.0,
+    )
+    .await;
+    let fields: Vec<&str> = strip(&o.stdout).split(' ').collect();
+    let (pid, dead) = match (o.ok(), fields.as_slice()) {
+        (true, [pid, dead]) => (pid.parse::<i64>().ok(), *dead == "1"),
+        _ => return PaneState::Busy,
+    };
+    if dead {
+        return PaneState::Idle;
+    }
+    let Some(pid) = pid else {
+        return PaneState::Busy;
+    };
+    let ps = cmd::run(&["ps", "-A", "-o", "pid=,ppid=,tpgid=,comm="], 5.0).await;
+    if !ps.ok() {
+        return PaneState::Busy;
+    }
+    let mut own: Option<(i64, String)> = None;
+    for line in ps.stdout.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(p), Some(pp), Some(tp)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(p), Ok(pp), Ok(tp)) = (p.parse::<i64>(), pp.parse::<i64>(), tp.parse::<i64>())
+        else {
+            continue;
+        };
+        if pp == pid {
+            return PaneState::Busy; // the shell has a child
+        }
+        if p == pid {
+            own = Some((tp, it.collect::<Vec<_>>().join(" ")));
+        }
+    }
+    match own {
+        Some((tpgid, comm)) if tpgid == pid => {
+            let base = comm
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .trim_start_matches('-');
+            if SHELLS.contains(&base) {
+                PaneState::Idle
+            } else {
+                PaneState::Busy
+            }
+        }
+        _ => PaneState::Busy,
+    }
+}
+
+/// The shell line that resumes the session.
+fn resume_line(origin: Origin, sid: &str, cwd: Option<&str>) -> String {
+    let q = sh_quote(sid);
+    let run = match origin {
+        Origin::Claude => format!("claude --resume {q}"),
+        Origin::Codex => format!("codex resume {q}"),
+    };
+    match cwd {
+        Some(c) => format!("cd {} && {run}", sh_quote(c)),
+        None => run,
+    }
+}
+
+/// `POST /api/resume {session_id}`.
+///
+/// 1. The id must look like a session id (400) and name a transcript on
+///    disk (404 otherwise; nothing is spawned).
+/// 2. The origin comes from the transcript: `claude --resume <id>` in
+///    `claude-<short>`, or `codex resume <id>` in `codex-<short>`.
+/// 3. Already running: a pane the live mapping (process walk, Codex tty /
+///    app-server cwd mapping — the same map `/api/local-sessions` uses)
+///    ties to this id, or a pane with this id's name that has something
+///    running in it, is returned as is (`reused`) and nothing is typed.
+/// 4. A Codex session running outside tmux → 409 (a second `codex resume`
+///    would write to the same thread).
+/// 5. A pane with this id's name holding only an idle shell (the agent
+///    exited — e.g. the `claude-<codex id>` panes Python's origin-blind
+///    resume left behind) is respawned (`respawn-pane -k`, which only kills
+///    that idle shell) and the command started in it (`respawned`). Python
+///    returned such a pane silently and the phone opened a bare prompt.
+/// 6. Otherwise a new session.
+///
+/// Claude responses and events keep Python's shape; Codex ones add
+/// `"origin": "codex"`.
 async fn resume(state: &Arc<State>, body: Py, h: &HeaderMap) -> HResult {
-    let session_id = strip(&get_str(&body, "session_id", "", "resume")?).to_string();
+    let session_id = strip(Fields(&body).str_or("session_id", "")?).to_string();
     if session_id.is_empty() {
         return Ok(err_json(StatusCode::BAD_REQUEST, "session_id required", h));
     }
-    let short = head(session_id.split('-').next().unwrap_or(""), 8);
-    let prefix = session_prefix();
-    let mut tmux_name = format!("{prefix}{short}");
-
-    let mut alive = cmd::run(&["tmux", "has-session", "-t", &tmux_name], 3.0)
-        .await
-        .ok();
-    if !alive {
-        let legacy = format!("{prefix}resume-{short}");
-        if cmd::run(&["tmux", "has-session", "-t", &legacy], 3.0)
-            .await
-            .ok()
-        {
-            tmux_name = legacy;
-            alive = true;
-        }
+    if !is_valid_session_id(&session_id) {
+        return Ok(err_json(StatusCode::BAD_REQUEST, "invalid session_id", h));
     }
-    if alive {
-        broadcast(
-            state,
-            Py::dict()
-                .with("type", "resume")
-                .with("session", tmux_name.as_str())
-                .with("claude_session_id", session_id.as_str())
-                .with("reused", true),
-        );
-        return Ok(send_json(
-            StatusCode::OK,
-            &Py::dict()
-                .with("tmux_session", tmux_name.as_str())
-                .with("claude_session_id", session_id.as_str()),
-            h,
-        ));
-    }
-
-    let projects = state.home.join(".claude/projects");
-    let resume_cwd = {
-        let (p, s, hm) = (projects.clone(), session_id.clone(), state.home.clone());
-        tokio::task::spawn_blocking(move || resolve_session_cwd(&p, &s, &hm))
+    let located = {
+        let (hm, sid) = (state.home.clone(), session_id.clone());
+        tokio::task::spawn_blocking(move || locate_transcript(&hm, &sid))
             .await
             .unwrap_or(None)
     };
-    let mut args = vec!["tmux", "new-session", "-d", "-s", tmux_name.as_str()];
-    if let Some(c) = &resume_cwd {
-        args.extend(["-c", c.as_str()]);
-    }
-    let o = cmd::run(&args, 10.0).await;
-    if o.rc != 0 {
-        let msg = if o.stderr.is_empty() {
-            "tmux failed"
-        } else {
-            &o.stderr
-        };
-        return Ok(err_json(StatusCode::INTERNAL_SERVER_ERROR, msg, h));
-    }
-    tmux_apply_options(&tmux_name).await;
-    let line = match &resume_cwd {
-        Some(c) => format!(
-            "cd {} && claude --resume {}",
-            sh_quote(c),
-            sh_quote(&session_id)
-        ),
-        None => format!("claude --resume {}", sh_quote(&session_id)),
+    let Some((origin, transcript)) = located else {
+        return Ok(err_json(StatusCode::NOT_FOUND, "unknown session", h));
     };
+    let short = head(session_id.split('-').next().unwrap_or(""), 8);
+    let names = match origin {
+        Origin::Claude => {
+            let prefix = session_prefix();
+            vec![
+                format!("{prefix}{short}"),
+                format!("{prefix}resume-{short}"),
+            ]
+        }
+        Origin::Codex => vec![format!("codex-{short}")],
+    };
+
+    // 3. already running
+    let mapped = {
+        let (hm, claude, sid) = (
+            state.home.clone(),
+            state.dirs.claude.clone(),
+            session_id.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let info = baton_core::tmuxmap::detect(&hm, &claude);
+            info.tmux_for
+                .get(&sid)
+                .filter(|_| !info.zombies.contains(&sid))
+                .cloned()
+        })
+        .await
+        .unwrap_or(None)
+    };
+    let mut idle: Option<String> = None;
+    for name in mapped.iter().chain(names.iter()) {
+        match pane_state(name).await {
+            PaneState::Busy => return Ok(resume_reused(state, name, &session_id, origin, h)),
+            PaneState::Idle if names.contains(name) && idle.is_none() => idle = Some(name.clone()),
+            _ => {}
+        }
+    }
+
+    // 4. a Codex CLI on a terminal outside tmux
+    if origin == Origin::Codex {
+        let sid = session_id.clone();
+        let tty = tokio::task::spawn_blocking(move || {
+            baton_core::tmuxmap::codex_tty_map()
+                .into_iter()
+                .find(|(s, _)| *s == sid)
+                .map(|(_, t)| t)
+        })
+        .await
+        .unwrap_or(None);
+        if let Some(tty) = tty {
+            return Ok(send_json(
+                StatusCode::CONFLICT,
+                &Py::dict()
+                    .with("error", "codex session is running outside tmux")
+                    .with("tty", tty),
+                h,
+            ));
+        }
+    }
+
+    let cwd = match origin {
+        Origin::Claude => {
+            let (p, s, hm) = (
+                state.home.join(".claude/projects"),
+                session_id.clone(),
+                state.home.clone(),
+            );
+            tokio::task::spawn_blocking(move || resolve_session_cwd(&p, &s, &hm))
+                .await
+                .unwrap_or(None)
+        }
+        Origin::Codex => codex_cwd(&transcript, &state.home),
+    };
+
+    // 5. / 6. start the agent: in the idle pane, or in a new session
+    let respawned = idle.is_some();
+    let tmux_name = match idle {
+        Some(name) => {
+            let t = target::pane(&name);
+            let mut args = vec!["tmux", "respawn-pane", "-k", "-t", t.as_str()];
+            if let Some(c) = &cwd {
+                args.extend(["-c", c.as_str()]);
+            }
+            let o = cmd::run(&args, 10.0).await;
+            if o.rc != 0 {
+                let msg = if o.stderr.is_empty() {
+                    "tmux respawn-pane failed"
+                } else {
+                    &o.stderr
+                };
+                return Ok(err_json(StatusCode::INTERNAL_SERVER_ERROR, msg, h));
+            }
+            name
+        }
+        None => {
+            let name = names[0].clone();
+            let mut args = vec!["tmux", "new-session", "-d", "-s", name.as_str()];
+            if let Some(c) = &cwd {
+                args.extend(["-c", c.as_str()]);
+            }
+            let o = cmd::run(&args, 10.0).await;
+            if o.rc != 0 {
+                let msg = if o.stderr.is_empty() {
+                    "tmux failed"
+                } else {
+                    &o.stderr
+                };
+                return Ok(err_json(StatusCode::INTERNAL_SERVER_ERROR, msg, h));
+            }
+            tmux_apply_options(&name).await;
+            name
+        }
+    };
+    let line = resume_line(origin, &session_id, cwd.as_deref());
     cmd::run(
-        &["tmux", "send-keys", "-t", &tmux_name, &line, "Enter"],
+        &[
+            "tmux",
+            "send-keys",
+            "-t",
+            &target::pane(&tmux_name),
+            &line,
+            "Enter",
+        ],
         3.0,
     )
     .await;
 
-    let haiku = haiku_title_for(&state.home, &session_id)?;
-    let tab_title = if haiku.is_empty() {
-        tmux_name.clone()
-    } else {
-        format!("{tmux_name} · {}", head(&haiku, 60).replace('"', "'"))
-    };
-    cmd::popen(&[
-        "osascript",
-        "-e",
-        &osa_open_attached(&tmux_name, &tab_title),
-    ]);
+    if !respawned || attached_ttys(&tmux_name).await.is_empty() {
+        let haiku = haiku_title_for(&state.home, &session_id)?;
+        let tab_title = if haiku.is_empty() {
+            tmux_name.clone()
+        } else {
+            format!("{tmux_name} · {}", head(&haiku, 60).replace('"', "'"))
+        };
+        cmd::popen(&[
+            "osascript",
+            "-e",
+            &osa_open_attached(&tmux_name, &tab_title),
+        ]);
+    }
 
-    let jsonl_bytes = find_session_jsonl(&projects, &session_id)
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let jsonl_bytes = std::fs::metadata(&transcript).map(|m| m.len()).unwrap_or(0);
     let est_ms = resume_estimate_ms(&state.home, jsonl_bytes);
     tokio::spawn(watch_resume_ready(
         state.clone(),
         tmux_name.clone(),
         session_id.clone(),
         jsonl_bytes,
+        origin,
     ));
-    broadcast(
-        state,
-        Py::dict()
-            .with("type", "resume")
-            .with("session", tmux_name.as_str())
-            .with("claude_session_id", session_id.as_str()),
-    );
-    Ok(send_json(
-        StatusCode::OK,
-        &Py::dict()
-            .with("tmux_session", tmux_name.as_str())
-            .with("claude_session_id", session_id.as_str())
-            .with("jsonl_bytes", jsonl_bytes)
-            .with("estimated_ms", est_ms),
-        h,
-    ))
+    let mut ev = Py::dict()
+        .with("type", "resume")
+        .with("session", tmux_name.as_str())
+        .with("claude_session_id", session_id.as_str());
+    let mut resp = Py::dict()
+        .with("tmux_session", tmux_name.as_str())
+        .with("claude_session_id", session_id.as_str())
+        .with("jsonl_bytes", jsonl_bytes)
+        .with("estimated_ms", est_ms);
+    if origin == Origin::Codex {
+        ev.set("origin", Py::str("codex"));
+        resp.set("origin", Py::str("codex"));
+    }
+    if respawned {
+        ev.set("respawned", Py::Bool(true));
+        resp.set("respawned", Py::Bool(true));
+    }
+    broadcast(state, ev);
+    Ok(send_json(StatusCode::OK, &resp, h))
 }
 
-/// `_watch_resume_ready`: poll the pane until Claude's prompt UI appears
-/// (≤180 s), record the duration for calibration, broadcast resume-ready.
-async fn watch_resume_ready(state: Arc<State>, tmux_name: String, sid: String, bytes: u64) {
+fn resume_reused(
+    state: &State,
+    tmux_name: &str,
+    session_id: &str,
+    origin: Origin,
+    h: &HeaderMap,
+) -> Response<Body> {
+    let mut ev = Py::dict()
+        .with("type", "resume")
+        .with("session", tmux_name)
+        .with("claude_session_id", session_id);
+    let mut resp = Py::dict()
+        .with("tmux_session", tmux_name)
+        .with("claude_session_id", session_id);
+    if origin == Origin::Codex {
+        ev.set("origin", Py::str("codex"));
+        resp.set("origin", Py::str("codex"));
+        resp.set("reused", Py::Bool(true));
+    }
+    ev.set("reused", Py::Bool(true));
+    broadcast(state, ev);
+    send_json(StatusCode::OK, &resp, h)
+}
+
+/// Codex's TUI footer once a resumed thread is loaded.
+const CODEX_READY_MARKERS: [&str; 3] = ["? for shortcuts", "context left", "⏎ send"];
+
+/// `_watch_resume_ready`: poll the pane until the agent's prompt UI appears
+/// (≤180 s), record the duration for calibration (Claude only — the
+/// estimate is Claude's load rate), broadcast resume-ready.
+async fn watch_resume_ready(
+    state: Arc<State>,
+    tmux_name: String,
+    sid: String,
+    bytes: u64,
+    origin: Origin,
+) {
+    let markers: &[&str] = match origin {
+        Origin::Claude => &READY_MARKERS,
+        Origin::Codex => &CODEX_READY_MARKERS,
+    };
+    let t = target::pane(&tmux_name);
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(180) {
-        let o = cmd::run(
-            &["tmux", "capture-pane", "-t", &tmux_name, "-p", "-S", "0"],
-            3.0,
-        )
-        .await;
+        let o = cmd::run(&["tmux", "capture-pane", "-t", &t, "-p", "-S", "0"], 3.0).await;
         if o.rc != 0 {
             return; // pane gone
         }
-        if READY_MARKERS.iter().any(|m| o.stdout.contains(m)) {
+        if markers.iter().any(|m| o.stdout.contains(m)) {
             let ms = t0.elapsed().as_millis() as u64;
-            let home = state.home.clone();
-            let _ =
-                tokio::task::spawn_blocking(move || record_resume_duration(&home, bytes, ms)).await;
-            broadcast(
-                &state,
-                Py::dict()
-                    .with("type", "resume-ready")
-                    .with("session", tmux_name.as_str())
-                    .with("claude_session_id", sid.as_str())
-                    .with("duration_ms", ms),
-            );
+            if origin == Origin::Claude {
+                let home = state.home.clone();
+                let _ =
+                    tokio::task::spawn_blocking(move || record_resume_duration(&home, bytes, ms))
+                        .await;
+            }
+            let mut ev = Py::dict()
+                .with("type", "resume-ready")
+                .with("session", tmux_name.as_str())
+                .with("claude_session_id", sid.as_str())
+                .with("duration_ms", ms);
+            if origin == Origin::Codex {
+                ev.set("origin", Py::str("codex"));
+            }
+            broadcast(&state, ev);
             return;
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1255,17 +1506,22 @@ async fn watch_resume_ready(state: Arc<State>, tmux_name: String, sid: String, b
 // ── /api/kill-session, /api/respond ────────────────────────────────────
 
 async fn kill(state: &Arc<State>, body: Py, h: &HeaderMap) -> HResult {
-    let session = strip(&get_str(&body, "session", "", "kill-session")?).to_string();
+    let session = strip(Fields(&body).str_or("session", "")?).to_string();
     if session.is_empty() {
         return Ok(err_json(StatusCode::BAD_REQUEST, "session required", h));
     }
-    if !is_safe_tmux_name(&session) {
+    if !target::is_safe(&session) {
         return Ok(err_json(StatusCode::BAD_REQUEST, "invalid session name", h));
     }
-    let o = cmd::run(&["tmux", "kill-session", "-t", &session], 5.0).await;
+    let o = cmd::run(
+        &["tmux", "kill-session", "-t", &target::session(&session)],
+        5.0,
+    )
+    .await;
     let mut already_gone = false;
     if o.rc != 0 {
-        if o.stderr.to_lowercase().contains("can't find session") {
+        // Also "no server running" (INC-043): nothing left to kill.
+        if target::is_missing(&o.stderr) {
             already_gone = true;
         } else {
             let msg = if o.stderr.is_empty() {
@@ -1296,20 +1552,63 @@ async fn kill(state: &Arc<State>, body: Py, h: &HeaderMap) -> HResult {
 }
 
 async fn respond(state: &Arc<State>, body: Py, h: &HeaderMap) -> HResult {
-    require_dict(&body, "respond")?;
-    let session = body.get("session").cloned().unwrap_or(Py::str(""));
-    let key = body.get("key").cloned().unwrap_or(Py::str("y"));
-    let (s, k) = (arg_str(&session, "run_cmd")?, arg_str(&key, "run_cmd")?);
-    cmd::run(&["tmux", "send-keys", "-t", &s, &k, "Enter"], 10.0).await;
-    focus_terminal_tab(&s).await;
+    let f = Fields(&body);
+    let s = f.str_or("session", "")?;
+    let k = f.str_or("key", "y")?;
+    if s.is_empty() {
+        return Ok(err_json(StatusCode::BAD_REQUEST, "session required", h));
+    }
+    if !target::is_safe(s) {
+        return Ok(err_json(StatusCode::BAD_REQUEST, "invalid session name", h));
+    }
+    let o = cmd::run(
+        &[
+            "tmux",
+            "send-keys",
+            "-t",
+            &target::pane(s),
+            &target::literal(k),
+            "Enter",
+        ],
+        10.0,
+    )
+    .await;
+    if o.rc != 0 && target::is_missing(&o.stderr) {
+        return Ok(err_json(StatusCode::NOT_FOUND, "no such session", h));
+    }
+    focus_terminal_tab(s).await;
     broadcast(
         state,
         Py::dict()
             .with("type", "respond")
-            .with("session", session)
-            .with("key", key),
+            .with("session", s)
+            .with("key", k),
     );
     Ok(send_json(StatusCode::OK, &Py::dict().with("ok", true), h))
+}
+
+/// ttys of the terminals attached to the session.
+async fn attached_ttys(name: &str) -> Vec<String> {
+    let o = cmd::run(
+        &[
+            "tmux",
+            "list-clients",
+            "-t",
+            &target::session(name),
+            "-F",
+            "#{client_tty}",
+        ],
+        2.0,
+    )
+    .await;
+    if o.rc != 0 {
+        return Vec::new();
+    }
+    strip(&o.stdout)
+        .split('\n')
+        .map(|t| strip(t).to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 /// `_focus_terminal_tab`: select the Terminal tab attached to the session
@@ -1318,15 +1617,11 @@ async fn focus_terminal_tab(name: &str) {
     if name.is_empty() {
         return;
     }
-    let o = cmd::run(
-        &["tmux", "list-clients", "-t", name, "-F", "#{client_tty}"],
-        2.0,
-    )
-    .await;
-    if o.rc != 0 {
-        return;
-    }
-    let tty = strip(strip(&o.stdout).split('\n').next().unwrap_or("")).to_string();
+    let tty = attached_ttys(name)
+        .await
+        .into_iter()
+        .next()
+        .unwrap_or_default();
     if tty.is_empty() {
         return;
     }
@@ -1339,26 +1634,6 @@ async fn focus_terminal_tab(name: &str) {
 // ── /api/hook-event, /api/register-device ──────────────────────────────
 
 fn hook_event(state: &Arc<State>, mut body: Py, h: &HeaderMap) -> HResult {
-    match &body {
-        Py::Dict(_) => {}
-        Py::List(_) => {
-            return Err(fail(
-                "TypeError",
-                "list indices must be integers or slices, not str",
-                "hook-event",
-            ))
-        }
-        other => {
-            return Err(fail(
-                "TypeError",
-                format!(
-                    "'{}' object does not support item assignment",
-                    other.type_name()
-                ),
-                "hook-event",
-            ))
-        }
-    }
     body.set("timestamp", Py::Float(logs::unix_now()));
     broadcast(state, body);
     Ok(send_json(StatusCode::OK, &Py::dict().with("ok", true), h))
@@ -1372,7 +1647,7 @@ fn devices_file(home: &Path) -> PathBuf {
 }
 
 fn register_device(state: &Arc<State>, body: Py, h: &HeaderMap) -> HResult {
-    let token = strip(&get_str(&body, "token", "", "register-device")?).to_string();
+    let token = strip(Fields(&body).str_or("token", "")?).to_string();
     if token.is_empty() {
         return Ok(err_json(StatusCode::BAD_REQUEST, "token required", h));
     }
@@ -1433,15 +1708,15 @@ fn register_device(state: &Arc<State>, body: Py, h: &HeaderMap) -> HResult {
 // ── /api/paste-image ───────────────────────────────────────────────────
 
 async fn paste_image(state: &Arc<State>, req: Request<Incoming>, h: &HeaderMap) -> HResult {
-    let n = content_length(h)?;
-    if n <= 0 || n > 25 * 1024 * 1024 {
+    let n = http::content_length(h)?;
+    if n == 0 || n > 25 * 1024 * 1024 {
         return Ok(err_json(
             StatusCode::BAD_REQUEST,
             "image required (<=25MB)",
             h,
         ));
     }
-    let mut data = raw_body(req).await;
+    let mut data = http::body_bytes(req).await?.to_vec();
     data.truncate(n as usize);
     let ctype = h
         .get("content-type")
@@ -1489,40 +1764,61 @@ fn env_or_config(home: &Path, name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// What `transcribe` produced.
+enum Transcript {
+    Text(String),
+    /// No backend could run (INC-039) → 503.
+    Unavailable,
+    /// The configured API answered with an error → 502, nothing typed.
+    Upstream(String),
+}
+
+const NO_BACKEND: &str = "no transcription backend";
+
 async fn voice(state: &Arc<State>, req: Request<Incoming>, h: &HeaderMap) -> HResult {
-    let n = content_length(h)?;
-    let mut data = raw_body(req).await;
-    data.truncate(n.max(0) as usize);
+    let n = http::content_length(h)?;
+    let session = h
+        .get("x-session")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| strip(s).to_string())
+        .unwrap_or_default();
+    if !session.is_empty() && !target::is_safe(&session) {
+        return Ok(err_json(StatusCode::BAD_REQUEST, "invalid session name", h));
+    }
+    let mut data = http::body_bytes(req).await?.to_vec();
+    data.truncate(n as usize);
     let tmp = std::env::temp_dir().join(format!("tmp{}.wav", logs::rand_hex(8)));
     std::fs::write(&tmp, &data).map_err(|e| fail("OSError", e.to_string(), "voice"))?;
     let res = transcribe(&state.home, &tmp).await;
-    let out = match res {
-        Ok(text) => {
-            let session = h
-                .get("x-session")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            if !session.is_empty() && !text.is_empty() {
-                cmd::run(&["tmux", "send-keys", "-t", &session, &text, "Enter"], 10.0).await;
-            }
-            Ok(send_json(
-                StatusCode::OK,
-                &Py::dict().with("text", text).with(
-                    "sent_to",
-                    if session.is_empty() {
-                        Py::None
-                    } else {
-                        Py::Str(session)
-                    },
-                ),
-                h,
-            ))
-        }
-        Err(f) => Err(f),
-    };
     let _ = std::fs::remove_file(&tmp);
-    out
+    let text = match res? {
+        Transcript::Text(t) => t,
+        Transcript::Unavailable => {
+            return Ok(err_json(StatusCode::SERVICE_UNAVAILABLE, NO_BACKEND, h))
+        }
+        Transcript::Upstream(e) => return Ok(err_json(StatusCode::BAD_GATEWAY, &e, h)),
+    };
+    let mut sent_to = Py::None;
+    if !session.is_empty() && !text.is_empty() {
+        let t = target::pane(&session);
+        let o = cmd::run(
+            &["tmux", "send-keys", "-t", &t, "-l", &target::literal(&text)],
+            10.0,
+        )
+        .await;
+        if o.ok() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cmd::run(&["tmux", "send-keys", "-t", &t, "Enter"], 10.0).await;
+            sent_to = Py::Str(session);
+        }
+    } else if !session.is_empty() {
+        sent_to = Py::Str(session);
+    }
+    Ok(send_json(
+        StatusCode::OK,
+        &Py::dict().with("text", text).with("sent_to", sent_to),
+        h,
+    ))
 }
 
 async fn whisper_compatible(
@@ -1561,7 +1857,7 @@ async fn whisper_compatible(
 }
 
 /// `transcribe_audio`: Groq → OpenAI → whisper-cpp → mlx-whisper → whisper.
-async fn transcribe(home: &Path, audio: &Path) -> Result<String, Fail> {
+async fn transcribe(home: &Path, audio: &Path) -> Result<Transcript, Fail> {
     let audio_s = audio.to_string_lossy().into_owned();
     let size = std::fs::metadata(audio).map(|m| m.len()).unwrap_or(0);
     let mut dur: Option<f64> = None;
@@ -1591,9 +1887,9 @@ async fn transcribe(home: &Path, audio: &Path) -> Result<String, Fail> {
     );
     if size < 4096 || dur.is_some_and(|d| d < 0.3) {
         let d = dur.map(|d| format!(", {d:.2}s")).unwrap_or_default();
-        return Ok(format!(
+        return Ok(Transcript::Text(format!(
             "Recording too short ({size} bytes{d}) — hold the mic button while speaking, then release"
-        ));
+        )));
     }
     let groq = env_or_config(home, "CS_GROQ_API_KEY");
     if !groq.is_empty() {
@@ -1605,12 +1901,13 @@ async fn transcribe(home: &Path, audio: &Path) -> Result<String, Fail> {
         )
         .await
         {
-            Ok(t) => return Ok(t),
+            Ok(t) => return Ok(Transcript::Text(t)),
             Err(e) => eprintln!("[voice] Groq error, falling through: {e}"),
         }
     }
     let openai = env_or_config(home, "CS_OPENAI_API_KEY");
     if !openai.is_empty() {
+        // Python returned the error as the transcript (typed into the pane).
         return Ok(
             match whisper_compatible(
                 &audio_s,
@@ -1620,8 +1917,8 @@ async fn transcribe(home: &Path, audio: &Path) -> Result<String, Fail> {
             )
             .await
             {
-                Ok(t) => t,
-                Err(e) => format!("OpenAI API error: {e}"),
+                Ok(t) => Transcript::Text(t),
+                Err(e) => Transcript::Upstream(format!("OpenAI API error: {e}")),
             },
         );
     }
@@ -1633,7 +1930,7 @@ async fn transcribe(home: &Path, audio: &Path) -> Result<String, Fail> {
             &wcpp
         };
         let o = cmd::run(&[c, "-f", &audio_s, "--no-timestamps"], 60.0).await;
-        return Ok(strip(&o.stdout).to_string());
+        return Ok(Transcript::Text(strip(&o.stdout).to_string()));
     }
     let mlx_py = std::env::var("CS_MLX_PYTHON").unwrap_or_else(|_| "/usr/bin/python3".into());
     if Path::new(&mlx_py).exists()
@@ -1644,7 +1941,7 @@ async fn transcribe(home: &Path, audio: &Path) -> Result<String, Fail> {
             .unwrap_or_else(|_| "mlx-community/whisper-large-v3-mlx".into());
         let o = cmd::run(&[&mlx_py, "-c", code, &audio_s, &model], 180.0).await;
         if o.rc == 0 && !strip(&o.stdout).is_empty() {
-            return Ok(strip(&o.stdout).to_string());
+            return Ok(Transcript::Text(strip(&o.stdout).to_string()));
         }
         let tail: String = {
             let ch: Vec<char> = o.stderr.chars().collect();
@@ -1653,12 +1950,8 @@ async fn transcribe(home: &Path, audio: &Path) -> Result<String, Fail> {
         eprintln!("[voice] mlx-whisper failed rc={}: {tail}", o.rc);
     }
     match cmd::status(&["whisper", "--help"]).await {
-        // Python's subprocess.run raises here when `whisper` is missing → 500.
-        None => Err(fail(
-            "FileNotFoundError",
-            "[Errno 2] No such file or directory: 'whisper'",
-            "transcribe_audio",
-        )),
+        // Python's subprocess.run raised here when `whisper` was missing → 500.
+        None => Ok(Transcript::Unavailable),
         Some(0) => {
             let td = std::env::temp_dir().join(format!("tmp{}", logs::rand_hex(8)));
             let _ = std::fs::create_dir_all(&td);
@@ -1684,19 +1977,19 @@ async fn transcribe(home: &Path, audio: &Path) -> Result<String, Fail> {
             });
             let text = txt.and_then(|p| std::fs::read_to_string(p).ok());
             let _ = std::fs::remove_dir_all(&td);
+            // Python: the text "No Whisper backend available" as a 200.
             Ok(match text {
-                Some(t) => strip(&t).to_string(),
-                None => "No Whisper backend available".into(),
+                Some(t) => Transcript::Text(strip(&t).to_string()),
+                None => Transcript::Unavailable,
             })
         }
-        Some(_) => Ok("No Whisper backend available".into()),
+        Some(_) => Ok(Transcript::Unavailable),
     }
 }
 
 // ── /api/client-metrics ────────────────────────────────────────────────
 
 fn client_metrics(body: Py, h: &HeaderMap) -> HResult {
-    require_dict(&body, "client-metrics")?;
     let records = match body.get("records") {
         Some(v) if v.truthy() => v.clone(),
         _ => Py::List(vec![]),
@@ -1755,32 +2048,6 @@ fn client_metrics(body: Py, h: &HeaderMap) -> HResult {
 
 static BENCH: Mutex<Vec<(String, Py)>> = Mutex::new(Vec::new());
 
-fn py_int(v: &Py, at: &'static str) -> Result<i128, Fail> {
-    match v {
-        Py::Int(i) => Ok(*i),
-        Py::Bool(b) => Ok(*b as i128),
-        Py::Float(f) if f.is_finite() => Ok(f.trunc() as i128),
-        Py::Str(s) => strip(s).replace('_', "").parse::<i128>().map_err(|_| {
-            fail(
-                "ValueError",
-                format!(
-                    "invalid literal for int() with base 10: {}",
-                    Py::str(s.as_str()).repr()
-                ),
-                at,
-            )
-        }),
-        other => Err(fail(
-            "TypeError",
-            format!(
-                "int() argument must be a string, a bytes-like object or a real number, not '{}'",
-                other.type_name()
-            ),
-            at,
-        )),
-    }
-}
-
 fn created_of(j: &Py) -> String {
     j.get("created")
         .and_then(Py::as_str)
@@ -1788,24 +2055,34 @@ fn created_of(j: &Py) -> String {
         .to_string()
 }
 
-fn bench_create(body: Py, h: &HeaderMap) -> HResult {
-    require_dict(&body, "bench/job")?;
-    let reps = py_int(body.get("reps").unwrap_or(&Py::Int(5)), "bench/job")?.clamp(1, 50);
+struct BenchJob {
+    reps: i128,
+    note: String,
+    ports: Vec<Py>,
+    tmux: String,
+}
+
+/// The fields of `POST /api/bench/job` (Python: `int(reps)`, `[int(p) for
+/// p in ports]` — a bad value raised; here it's a 400).
+fn bench_job_fields(body: &Py) -> Result<BenchJob, BadRequest> {
+    let f = Fields(body);
+    let reps = f.int("reps")?.unwrap_or(5).clamp(1, 50);
     let note = head(
         &body.get("note").cloned().unwrap_or(Py::str("")).py_str(),
         200,
     );
     let ports: Vec<Py> = match body.get("ports") {
-        Some(Py::List(l)) => l
-            .iter()
-            .map(|p| py_int(p, "bench/job").map(Py::Int))
-            .collect::<Result<Vec<_>, _>>()?,
+        Some(Py::List(l)) => {
+            let mut out = Vec::new();
+            for p in l {
+                let n = http::int_of(p)
+                    .ok_or_else(|| BadRequest::new("field 'ports' must hold integers"))?;
+                out.push(Py::Int(n));
+            }
+            out
+        }
         Some(v) if v.truthy() => {
-            return Err(fail(
-                "TypeError",
-                format!("'{}' object is not iterable", v.type_name()),
-                "bench/job",
-            ))
+            return Err(BadRequest::new("field 'ports' must be an array"));
         }
         _ => vec![],
     };
@@ -1814,6 +2091,42 @@ fn bench_create(body: Py, h: &HeaderMap) -> HResult {
         Some(v) if v.truthy() => head(&v.py_str(), 60),
         _ => String::new(),
     };
+    Ok(BenchJob {
+        reps,
+        note,
+        ports,
+        tmux,
+    })
+}
+
+/// Without `--dev` the queue stays in the upstream Python server; the body
+/// is checked here first so a malformed one is a 400, not Python's 500.
+async fn bench_proxy(state: &Arc<State>, req: Request<Incoming>) -> Response<Body> {
+    let (parts, body) = req.into_parts();
+    let bytes = match body.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return BadRequest::new("could not read request body").response(&parts.headers),
+    };
+    let checked = http::parse_object(&bytes).and_then(|b| {
+        if parts.uri.path() == "/api/bench/job" {
+            bench_job_fields(&b).map(|_| ())
+        } else {
+            Ok(())
+        }
+    });
+    match checked {
+        Err(e) => e.response(&parts.headers),
+        Ok(()) => state.upstream.forward_bytes(parts, bytes).await,
+    }
+}
+
+fn bench_create(body: Py, h: &HeaderMap) -> HResult {
+    let BenchJob {
+        reps,
+        note,
+        ports,
+        tmux,
+    } = bench_job_fields(&body)?;
     let id = logs::rand_hex(8);
     let job = Py::dict()
         .with("id", id.as_str())
@@ -1871,7 +2184,6 @@ fn bench_list(h: &HeaderMap) -> Response<Body> {
 }
 
 fn bench_done(body: Py, h: &HeaderMap) -> HResult {
-    require_dict(&body, "bench/done")?;
     let id = body.get("id").cloned().unwrap_or(Py::str("")).py_str();
     let mut jobs = BENCH.lock().unwrap_or_else(|p| p.into_inner());
     let found = jobs.iter_mut().find(|(k, _)| *k == id);
@@ -1948,13 +2260,9 @@ mod tests {
     }
 
     #[test]
-    fn quoting_and_names() {
+    fn quoting() {
         assert_eq!(sh_quote(""), "''");
         assert_eq!(sh_quote("it's"), "'it'\\''s'");
-        assert!(is_safe_tmux_name("claude-ab_1.2"));
-        assert!(!is_safe_tmux_name("a b"));
-        assert!(!is_safe_tmux_name(""));
-        assert!(!is_safe_tmux_name(&"a".repeat(201)));
     }
 
     #[test]
@@ -1991,6 +2299,63 @@ mod tests {
         record_spawn(&f, "claude-a", Some("p"), "task");
         let text = std::fs::read_to_string(&f).unwrap();
         assert!(text.starts_with("{\n  \"claude-a\": {\n    \"parent_id\": \"p\",\n    \"spawn_kind\": \"task\",\n    \"spawned_at\": "));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resume_ids_and_origin() {
+        for ok in [
+            "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1",
+            "agent-abc_1",
+            "deadbeef-0000",
+        ] {
+            assert!(is_valid_session_id(ok), "{ok}");
+        }
+        for bad in ["", "*", "../x", "[a-f]*", "a b", "-x", "a/b", "a.b", "a;b"] {
+            assert!(!is_valid_session_id(bad), "{bad:?}");
+        }
+        assert!(!is_valid_session_id(&"a".repeat(129)));
+
+        let dir = std::env::temp_dir().join(format!("baton-ctl-test-{}", logs::rand_hex(6)));
+        let (cl, cx) = (
+            "c1c1c1c1-0000-4000-8000-000000000001",
+            "d2d2d2d2-0000-4000-8000-000000000002",
+        );
+        let proj = dir.join(".claude/projects/-p");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join(format!("{cl}.jsonl")), "{}\n").unwrap();
+        let day = dir.join(".codex/sessions/2026/09/27");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = day.join(format!("rollout-2026-09-27T10-00-00-{cx}.jsonl"));
+        std::fs::write(
+            &rollout,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{cx}\",\"cwd\":\"{}\"}}}}\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            locate_transcript(&dir, cl).map(|t| t.0),
+            Some(Origin::Claude)
+        );
+        assert_eq!(
+            locate_transcript(&dir, cx),
+            Some((Origin::Codex, rollout.clone()))
+        );
+        assert_eq!(locate_transcript(&dir, "nope-0000"), None);
+        assert_eq!(
+            codex_cwd(&rollout, &dir),
+            Some(dir.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            resume_line(Origin::Codex, cx, Some("/p q")),
+            format!("cd '/p q' && codex resume '{cx}'")
+        );
+        assert_eq!(
+            resume_line(Origin::Claude, cl, None),
+            format!("claude --resume '{cl}'")
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

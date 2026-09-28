@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """Parity + latency gate for the tmux group (PLAN.md slice 4).
 
-Compares the Rust daemon (`baton serve`, default 127.0.0.1:19883) with the
-Python reference server (127.0.0.1:19877) on throwaway tmux sessions named
-`csm-bench-tmux-*` that this script creates and kills. It never sends keys
-to, scrolls, resizes or kills any other session; `/api/sessions` lists the
-user's real sessions read-only.
+Compares the Rust daemon (`baton serve`) with the Python reference server,
+both started here inside the regression sandbox (bench/regress/world.py):
+temp HOME, a private tmux server pinned by socket (`-S`, never the user's
+server), fake claude/codex/osascript first on PATH and a socket-pinned tmux
+shim, so both servers' own tmux calls land in the sandbox too. The
+throwaway sessions are named `csm-bench-tmux-*`; `/api/sessions` lists the
+sandbox's panes. Nothing is sent to the live server or the user's tmux.
 
-  python3 bench/parity_tmux.py [--rs-port 19883] [--py-port 19877]
-                               [--bin path/to/baton] [--n-scroll 100]
+  python3 bench/parity_tmux.py [--bin path/to/baton] [--ref <claude-session-manager>]
+                               [--n-scroll 100] [--keep]
 
-Starts the daemon if nothing listens on --rs-port (and stops it at the end).
+Intended divergences (the daemon implements the incident catalog's fix,
+Python still has the bug) are asserted as such, not as identical:
+  * scroll / send-key to a missing pane: Python 500, daemon 404 (INC-031,
+    INC-015); tmux targets are exact `=name` (INC-050);
+  * wrong JSON field types: Python 500, daemon 400 (INC-041).
+
 Exit status 0 = every parity check passed.
 """
 import argparse
@@ -19,7 +26,6 @@ import json
 import os
 import shutil
 import socket
-import subprocess
 import sys
 import tempfile
 import threading
@@ -29,31 +35,22 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 APP = HERE / "tmux_bench_app.py"
 PREFIX = "csm-bench-tmux-"
+sys.path.insert(0, str(HERE / "regress"))
+from core import wait_http, Client  # noqa: E402
+from world import REF_DEFAULT, World, start_daemon, start_python  # noqa: E402
+
+WORLD = None  # the sandbox (set in main)
 
 
-def token():
-    if os.environ.get("BATON_BEARER"):
-        return os.environ["BATON_BEARER"].strip()
-    cfg = Path.home() / ".claude-sessions" / "config"
-    tok = ""
-    for line in cfg.read_text().splitlines() if cfg.exists() else []:
-        line = line.strip()
-        if line.startswith("export "):
-            line = line[7:].strip()
-        if line.startswith("BATON_BEARER="):
-            tok = line.split("=", 1)[1].strip().strip("\"'")
-    return tok
+H = {}  # the sandbox token, set in main
 
 
-TOKEN = token()
-H = {"Authorization": "Bearer " + TOKEN}
-
-
-# ── tmux (bench sessions only) ────────────────────────────────────────────
+# ── tmux (sandbox server only) ────────────────────────────────────────────
 
 def tmux(*args):
+    # world.tmux pins the sandbox socket (-S) and refuses when it's gone.
     # Every -t target this script passes is one of its own sessions (own()).
-    return subprocess.run(["tmux", *args], capture_output=True, text=True)
+    return WORLD.tmux(*args)
 
 
 def own(name):
@@ -64,7 +61,7 @@ def own(name):
 def new_session(name, cmd, cols=100, rows=30):
     own(name)
     tmux("kill-session", "-t", "=" + name)
-    r = tmux("new-session", "-d", "-s", name, "-x", str(cols), "-y", str(rows), cmd)
+    r = tmux("new-session", "-d", "-s", name, "-x", str(cols), "-y", str(rows), "-c", str(WORLD.proj), cmd)
     assert r.returncode == 0, r.stderr
 
 
@@ -268,10 +265,16 @@ def run(args):
             a = request(py, "GET", "/api/pane/" + sess["seq"] + q)
             b = request(rs, "GET", "/api/pane/" + sess["seq"] + q)
             g.check("/api/pane%s identical" % q, a == b, "%d bytes" % len(b[2]))
-        for name in ("bad%20name", gone):
-            g.check("/api/pane/%s identical" % name,
-                    request(py, "GET", "/api/pane/" + name) == request(rs, "GET", "/api/pane/" + name),
-                    request(rs, "GET", "/api/pane/" + name)[2][:80].decode())
+        g.check("/api/pane/bad%20name identical",
+                request(py, "GET", "/api/pane/bad%20name") == request(rs, "GET", "/api/pane/bad%20name"),
+                request(rs, "GET", "/api/pane/bad%20name")[2][:80].decode())
+        # Intended divergence: both 404, but the daemon targets `=name:`
+        # exactly (INC-050) and answers {"error": "no such session"} instead
+        # of relaying tmux's wording.
+        a, b = request(py, "GET", "/api/pane/" + gone), request(rs, "GET", "/api/pane/" + gone)
+        g.check("/api/pane/%s → 404 both (daemon: no such session)" % gone,
+                a[0] == b[0] == 404 and json.loads(b[2]) == {"error": "no such session"},
+                "py %r, rs %r" % (a[2][:60], b[2][:60]))
 
         print("scroll / send / send-key effects (twin panes, one per server)")
         twins = {"py": (py, sess["in_py"], logs["in_py"]), "rs": (rs, sess["in_rs"], logs["in_rs"])}
@@ -309,21 +312,31 @@ def run(args):
             ("/api/scroll", {"session": sess["in_rs"], "direction": "left"}),
             ("/api/scroll", {"direction": "up"}),
             ("/api/scroll", {"session": "bad name", "direction": "up"}),
-            ("/api/scroll", {"session": PREFIX + "gone", "direction": "up"}),
             ("/api/send-key", {"session": sess["in_rs"]}),
             ("/api/send-key", {"keys": ["Up"]}),
             ("/api/send-key", {"session": "", "keys": 5}),
-            ("/api/send-key", {"session": PREFIX + "gone", "keys": ["Up"]}),
         ]
         for path, body in bad:
             g.check("%s %s identical" % (path, json.dumps(body)), request(py, "POST", path, body) == request(rs, "POST", path, body),
                     request(rs, "POST", path, body)[2].decode()[:80])
+        # Intended divergence: a missing pane is a 404 in the daemon (Python
+        # maps tmux's failure to 500) — INC-031 / INC-015.
+        for path, body in [("/api/scroll", {"session": PREFIX + "gone", "direction": "up"}),
+                           ("/api/send-key", {"session": PREFIX + "gone", "keys": ["Up"]})]:
+            a, b = request(py, "POST", path, body), request(rs, "POST", path, body)
+            g.check("%s %s → Python 500, daemon 404 (INC-031/015)" % (path, json.dumps(body)),
+                    a[0] == 500 and b[0] == 404 and json.loads(b[2]) == {"error": "no such session"},
+                    "py %d, rs %d %s" % (a[0], b[0], b[2][:80]))
+        # Intended divergence: wrong field types are a 400 with a JSON error
+        # in the daemon, Python's handler raises (500) — INC-041.
         for path, body in [("/api/scroll", {"session": 5, "direction": "up"}), ("/api/send-key", {"session": sess["in_rs"], "keys": 5})]:
             a, b = request(py, "POST", path, body), request(rs, "POST", path, body)
-            g.check("%s %s → 500 internal error both" % (path, json.dumps(body)),
-                    a[0] == b[0] == 500 and json.loads(a[2])["error"] == json.loads(b[2])["error"] == "internal error")
+            g.check("%s %s → Python 500 internal error, daemon 400 (INC-041)" % (path, json.dumps(body)),
+                    a[0] == 500 and json.loads(a[2])["error"] == "internal error"
+                    and b[0] == 400 and "must be" in json.loads(b[2])["error"],
+                    "py %d, rs %d %s" % (a[0], b[0], b[2][:80]))
 
-        print("/api/sessions (the user's live tmux sessions, read-only)")
+        print("/api/sessions (the sandbox's tmux sessions)")
         same, diffs = False, None
         for _ in range(8):
             got = {}
@@ -393,36 +406,38 @@ def run(args):
     return 0 if not fails else 1
 
 
-def listening(port):
-    with socket.socket() as s:
-        s.settimeout(0.3)
-        return s.connect_ex(("127.0.0.1", port)) == 0
-
-
 def main():
+    global WORLD
     ap = argparse.ArgumentParser()
-    ap.add_argument("--py-port", type=int, default=19877)
-    ap.add_argument("--rs-port", type=int, default=19883)
     ap.add_argument("--bin", default=os.environ.get("BATON_BIN", str(
         Path(os.environ.get("CARGO_TARGET_DIR", HERE.parent / "target")) / "release" / "baton")))
+    ap.add_argument("--ref", default=str(REF_DEFAULT))
     ap.add_argument("--n-first", type=int, default=20)
     ap.add_argument("--n-scroll", type=int, default=100)
     ap.add_argument("--n-sf", type=int, default=30)
+    ap.add_argument("--keep", action="store_true", help="keep the sandbox dirs")
     args = ap.parse_args()
-    proc = None
-    if not listening(args.rs_port):
-        proc = subprocess.Popen([args.bin, "serve", "--listen", "127.0.0.1:%d" % args.rs_port,
-                                 "--upstream", "http://127.0.0.1:%d" % args.py_port],
-                                stderr=subprocess.DEVNULL)
-        for _ in range(50):
-            if listening(args.rs_port):
-                break
-            time.sleep(0.1)
+    WORLD = World(shims=False, keep=args.keep)
+    H["Authorization"] = "Bearer " + WORLD.token
+    servers = []
     try:
-        sys.exit(run(args))
+        py = start_python(WORLD, args.ref)
+        servers.append(py)
+        if wait_http(Client("127.0.0.1", py.port, WORLD.token), 60) is None:
+            sys.exit("sandbox python did not start: " + py.err_path.read_text()[-800:])
+        rs = start_daemon(WORLD, args.bin, py.port)
+        servers.append(rs)
+        if wait_http(Client("127.0.0.1", rs.port, WORLD.token), 30) is None:
+            sys.exit("sandbox daemon did not start: " + rs.err_path.read_text()[-800:])
+        args.py_port, args.rs_port = py.port, rs.port
+        rc = run(args)
     finally:
-        if proc:
-            proc.terminate()
+        for srv in reversed(servers):
+            srv.stop()
+        WORLD.close()
+        if args.keep:
+            print("kept sandbox %s" % WORLD.root)
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

@@ -294,17 +294,25 @@ cosmetic / annoyance.
   `claude --resume <codex-id>`.
 - **Root cause:**
   - TUI: fixed; it now uses `tmux_resume_command(sid, cwd, origin, …)`.
-  - Server: **suspected, unverified.** `/api/resume` in both Python and Rust has no origin
-    branch. It checks `claude-<short>` / `claude-resume-<short>` and spawns `claude --resume`.
-    Baton's terminal auto-resume for a non-tmux Codex chat would therefore start Claude. The main
-    session had flagged this path as unchecked at 11:15.
-- **Fix:** TUI in `5cbff2b`; server/daemon open.
+  - Server: **confirmed** by `resume-by-origin` (sandbox). `/api/resume` in Python (and the
+    daemon before `fix/control`) has no origin branch. It checks `claude-<short>` /
+    `claude-resume-<short>` and spawns `claude --resume <id>`, so a Codex id starts Claude in
+    `claude-<short>`; Claude exits and leaves an idle shell there (e.g. the live
+    `claude-01a08980`), which the next resume then returns silently. Unknown ids spawn too.
+- **Fix:** TUI in `5cbff2b`. Daemon: `fix/control` — origin from the transcript (Claude jsonl,
+  else Codex rollout; neither → 404, nothing spawned); `codex resume <id>` in `codex-<short>`
+  in the rollout's cwd; a running session (live pane mapping incl. the Codex tty/app-server
+  mapping, or a busy pane with the id's name) is returned without typing into it; a Codex CLI
+  running outside tmux → 409; a pane with the id's name holding only an idle shell is
+  respawned with the command (`respawned: true`) rather than returned. Python: open.
 - **Detection:** top-10 check #2. Temp HOME with a Codex rollout plus a Claude transcript, and
   fake `claude`/`codex` binaries that record argv and cwd to a file.
   - `POST /api/resume {session_id: <codex>}` → 200 with `tmux_session`, and the recorded argv is
     `codex resume <id>`.
   - With an existing `codex-<short>` pane, it reuses that pane (`reused: true`) and spawns
     nothing.
+  - `resume-existing-pane`: an idle-shell `claude-<short>` pane gets `claude --resume <id>`
+    started in it; a busy one is returned untouched.
   - TUI Pilot: `m` on a Codex row builds `codex resume`.
 - **Runs on:** SANDBOX, UI.
 
@@ -360,6 +368,7 @@ cosmetic / annoyance.
   `claude-resume-<id8>`, which only existed after an explicit resume, so the send silently went
   nowhere.
 - **Fix:** `94e70ee` (live tmux mapping in the grouped JSON), `a25c154` (terminal-first routing).
+  Daemon (`fix/control`): `send` / `send-key` to a missing pane → 404 (Python: 200 / 500).
 - **Detection:**
   - Covered by check #1.
   - Plus ANY/SANDBOX: `POST /api/send` / `send-key` to a non-existent pane returns 404
@@ -619,7 +628,9 @@ cosmetic / annoyance.
 - **Root cause:** partly open. `tmux send-keys -t <name>` failed or timed out (3 s timeout,
   exceeded under load and GIL contention) and was mapped to 500. A pane that vanished also gives
   500, not 404. There is no `=` exact-target prefix (see INC-050).
-- **Fix:** R8 reduced the contention; the error mapping is unchanged.
+- **Fix:** R8 reduced the contention. Daemon (`fix/control`): exact `=name:` targets and a
+  vanished pane → 404 on scroll / send / send-key / respond / pane. The 504-on-slow-tmux part
+  is not done. Python: unchanged.
 - **Detection:**
   - ANY/SANDBOX: scroll to a non-existent session → 404 in < 100 ms.
   - SANDBOX: a tmux shim that sleeps 5 s → a 504-class error within 3.5 s, not a 40 s hold.
@@ -737,6 +748,10 @@ cosmetic / annoyance.
 - **Root cause:** the launchd-spawned Python didn't source `~/.claude-sessions/config` (Groq
   key), and the orphan `whisper` had a Python 3.9 shebang. With no backend, `/api/voice` → 500.
 - **Fix:** `csm_config._maybe_load_env_file` (`CSM_ENV_FILE` list, strips `export `), plist env.
+  Daemon (`fix/control`): no backend → 503 `{"error":"no transcription backend"}` (also when
+  `whisper` exists but can't run, where Python returned the text "No Whisper backend
+  available" as a 200 and typed it into the pane); an OpenAI error → 502, not typed. The
+  sandbox pins `CS_MLX_PYTHON` to a missing path so mlx-whisper can't download a model.
 - **Detection:** SANDBOX: a server started with a launchd-like env (`env -i` plus the plist env)
   and no backends. `POST /api/voice` (1 s silent WAV) → 503
   `{"error":"no transcription backend"}`, never 500. With a stub Groq endpoint → 200 plus the
@@ -760,7 +775,8 @@ cosmetic / annoyance.
 - **Symptom:** `AttributeError: 'int' object has no attribute 'strip'` (`/api/scroll` with
   `session: 1`) and `TypeError: 'int' object is not iterable` (`/api/send-key` with `keys: 1`).
 - **Root cause:** `body.get(...).strip()` without type checks.
-- **Fix:** open (Python).
+- **Fix:** open (Python). Daemon (`fix/control`): typed field access (`http::Fields`) on every
+  POST endpoint → 400 naming the field.
 - **Detection:** part of top-10 check #5, with type fuzz on every POST field → 400.
 - **Runs on:** ANY.
 
@@ -786,12 +802,12 @@ parity scripts allow the divergence.
 |---|---|---|---|
 | INC-043 | `POST /api/kill-session` → 500 when no tmux server is running | 404 `{"error":"no such session"}` (or 200 `{ok:false}`); never 500. Test with `TMUX_TMPDIR` pointing to an empty dir. | SANDBOX |
 | INC-044 | Voice 500 without whisper | see INC-039 | SANDBOX |
-| INC-045 | Malformed request bodies (invalid JSON, non-object JSON, wrong `Content-Type`) → 500 | 400 with a JSON error, for every POST endpoint | ANY |
+| INC-045 | Malformed request bodies (invalid JSON, non-object JSON, wrong `Content-Type`) → 500 | 400 with a JSON error, for every POST endpoint. **Daemon fixed** (`fix/control`: one parser, `http::read_object`; `/api/bench/*` validated before proxying) | ANY |
 | INC-046 | A malformed tty map (`~/.claude/…tty map` with garbage or wrong types) hides orphans | `/api/orphans` ignores bad entries and still lists orphans; the list still builds | SANDBOX |
-| INC-047 | Resume ids unvalidated, then used in a glob | `POST /api/resume {session_id: "*"}` / `"../x"` / `"[a-f]*"` → 400; no pane spawned (fake-binary argv log stays empty) | SANDBOX |
+| INC-047 | Resume ids unvalidated, then used in a glob | `POST /api/resume {session_id: "*"}` / `"../x"` / `"[a-f]*"` → 400; no pane spawned (fake-binary argv log stays empty). **Daemon fixed** (`fix/control`: ids must be `[A-Za-z0-9_-]{1,128}`) | SANDBOX |
 | INC-048 | Session ids used as glob wildcards in lookups | `/api/session/*`, `/api/messages/0*`, `/api/tail/?…` → 400/404, never another session's content | ANY |
-| INC-049 | `a;b` in tmux path params is passed to tmux (command separator) | `/api/pane/a;b`, `/api/pane-stream/a%3Bb`, scroll `session:"a;b"` → 400 (`_is_safe_tmux_name` on every tmux entry point) | SANDBOX |
-| INC-050 | tmux prefix matching: `-t name` without `=` targets `name-2` or `name…` when `name` is gone | bench panes `csm-bench-a` (killed) and `csm-bench-ab` (alive): scroll/send/kill/pane to `csm-bench-a` → 404, and `csm-bench-ab` receives nothing | SANDBOX |
+| INC-049 | `a;b` in tmux path params is passed to tmux (command separator) | `/api/pane/a;b`, `/api/pane-stream/a%3Bb`, scroll `session:"a;b"` → 400 (`_is_safe_tmux_name` on every tmux entry point). **Daemon fixed** (`fix/control`: `tmux_target::is_safe` on pane, pane-stream, scroll, send, send-key, respond, kill, voice `X-Session`; a key or message ending in `;` — tmux's separator, e.g. send-key `["x;", "kill-server"]` — is escaped, check `tmux-arg-separator`) | SANDBOX |
+| INC-050 | tmux prefix matching: `-t name` without `=` targets `name-2` or `name…` when `name` is gone | bench panes `csm-bench-a` (killed) and `csm-bench-ab` (alive): scroll/send/kill/pane to `csm-bench-a` → 404, and `csm-bench-ab` receives nothing. **Daemon fixed** (`fix/control`: every target is `=name` / `=name:`; kill of a missing session stays 200 `already_gone`, INC-043) | SANDBOX |
 | INC-051 | `/api/asset` crashes on latin-1 / non-UTF-8 filenames | file named `caf\xe9.txt` in an allowed root → 200 with correct bytes; `Content-Disposition` is RFC 5987-encoded | SANDBOX |
 | INC-052 | An unpaired markdown/HTML tag in a transcript drops the following text in the preview | fixture message `a <b> c` / `<details>x` → the preview HTML contains `c` / `x` | SANDBOX |
 | INC-053 | An invalid UTF-8 line in a transcript → `/api/messages` 500 | fixture transcript with a `\xff` line → 200, the other messages present | SANDBOX |

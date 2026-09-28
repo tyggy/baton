@@ -2,8 +2,12 @@
 //! /api/send, /api/send-key, /api/sessions, resize.
 //! Parity reference: claude-session-manager/server/api_server.py
 //! (`_stream_pane`, `_send_pane_snapshot`, `_maybe_resize_pane`,
-//! `_await_pane_settle`, `get_sessions`, the POST handlers). Same tmux
-//! invocations, same bytes on the wire; `text` holds the pure transforms.
+//! `_await_pane_settle`, `get_sessions`, the POST handlers). Same bytes on
+//! the wire; `text` holds the pure transforms. Intended divergences from
+//! Python: every tmux target is exact (`=name`, INC-050), every name goes
+//! through `tmux_target::is_safe` (INC-049), POST bodies go through the
+//! shared parser (400 instead of 500, INC-041/045), and a missing pane is a
+//! 404 on scroll / send / send-key (INC-031, INC-015).
 
 mod sse;
 pub mod text;
@@ -11,13 +15,15 @@ pub mod text;
 use super::Routed;
 use crate::http;
 use crate::proxy::Body;
+use crate::pyjson::Py;
 use crate::state::State;
-use baton_core::pyfmt::{strip, truthy};
+use crate::tmux_target as target;
+use baton_core::pyfmt::strip;
 use bytes::Bytes;
+use http::{BadRequest, Fields};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{HeaderMap, Method, Request, Response, StatusCode};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -53,15 +59,16 @@ pub async fn route(state: &Arc<State>, req: Request<Incoming>) -> Routed {
         }
         Method::POST if matches!(path.as_str(), "/api/scroll" | "/api/send" | "/api/send-key") => {
             let headers = req.headers().clone();
-            let Some(body) = read_body(req).await else {
-                return Ok(internal_error(&headers));
+            let body = match http::read_object(req).await {
+                Ok(b) => b,
+                Err(e) => return Ok(e.response(&headers)),
             };
             let resp = match path.as_str() {
                 "/api/scroll" => scroll(state, &body, &headers).await,
                 "/api/send" => send(state, &body, &headers).await,
                 _ => send_key(state, &body, &headers).await,
             };
-            Ok(resp)
+            Ok(resp.unwrap_or_else(|e| e.response(&headers)))
         }
         _ => Err(req),
     }
@@ -223,7 +230,7 @@ async fn pane_window_size(name: &str) -> Option<(i64, i64)> {
             "display-message",
             "-p",
             "-t",
-            name,
+            &target::pane(name),
             "#{window_width} #{window_height}",
         ],
         2.0,
@@ -259,7 +266,14 @@ async fn pane_window_size_cached(name: &str) -> Option<(i64, i64)> {
 /// `_list_session_clients`: ttys of the Mac terminals attached.
 async fn list_session_clients(name: &str) -> Vec<String> {
     let (out, _, rc) = run_cmd(
-        &["tmux", "list-clients", "-t", name, "-F", "#{client_tty}"],
+        &[
+            "tmux",
+            "list-clients",
+            "-t",
+            &target::session(name),
+            "-F",
+            "#{client_tty}",
+        ],
         2.0,
     )
     .await;
@@ -284,13 +298,14 @@ async fn resize_terminal_app_window(tty: &str, cols: i64, rows: i64) -> bool {
 /// `_resize_tmux_window`: resize, then back to `window-size latest`.
 async fn resize_tmux_window(name: &str, cols: i64, rows: i64) {
     let (c, r) = (cols.to_string(), rows.to_string());
+    let t = target::pane(name);
     run_cmd(
-        &["tmux", "resize-window", "-t", name, "-x", &c, "-y", &r],
+        &["tmux", "resize-window", "-t", &t, "-x", &c, "-y", &r],
         2.0,
     )
     .await;
     run_cmd(
-        &["tmux", "set-option", "-t", name, "window-size", "latest"],
+        &["tmux", "set-option", "-t", &t, "window-size", "latest"],
         2.0,
     )
     .await;
@@ -451,25 +466,6 @@ fn error(status: StatusCode, msg: &str, headers: &HeaderMap) -> Response<Body> {
     )
 }
 
-/// A handler that raised in Python: `{"error": "internal error", "rid": …}`.
-fn internal_error(headers: &HeaderMap) -> Response<Body> {
-    let rid = format!(
-        "{:08x}",
-        (now().fract() * 1e9) as u64 ^ std::process::id() as u64
-    )
-    .chars()
-    .take(8)
-    .collect::<String>();
-    json(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        &J::Obj(vec![
-            ("error", J::Str("internal error".into())),
-            ("rid", J::Str(rid)),
-        ]),
-        headers,
-    )
-}
-
 fn ok(headers: &HeaderMap) -> Response<Body> {
     json(
         StatusCode::OK,
@@ -478,33 +474,21 @@ fn ok(headers: &HeaderMap) -> Response<Body> {
     )
 }
 
-/// `read_body()`: empty → {}; bytes that aren't a JSON object made the
-/// Python handler raise (→ 500), signalled here as `None`.
-async fn read_body(req: Request<Incoming>) -> Option<serde_json::Map<String, Value>> {
-    let bytes = req.into_body().collect().await.ok()?.to_bytes();
-    if bytes.is_empty() {
-        return Some(serde_json::Map::new());
-    }
-    match serde_json::from_slice(&bytes).ok()? {
-        Value::Object(m) => Some(m),
-        _ => None,
-    }
-}
-
 // ── GET /api/pane/{name} ──────────────────────────────────────────────────
 
 async fn pane_snapshot(name: &str, history: i128, headers: &HeaderMap) -> Response<Body> {
-    if !text::is_safe_tmux_name(name) {
+    if !target::is_safe(name) {
         return error(StatusCode::BAD_REQUEST, "invalid session name", headers);
     }
-    run_cmd(&["tmux", "send-keys", "-t", name, "-X", "cancel"], 2.0).await;
+    let t = target::pane(name);
+    run_cmd(&["tmux", "send-keys", "-t", &t, "-X", "cancel"], 2.0).await;
     let start = format!("-{history}");
     let (out, err, rc) = run_cmd(
         &[
             "tmux",
             "capture-pane",
             "-t",
-            name,
+            &t,
             "-p",
             "-e",
             "-J",
@@ -515,6 +499,9 @@ async fn pane_snapshot(name: &str, history: i128, headers: &HeaderMap) -> Respon
     )
     .await;
     if rc != 0 {
+        if target::is_missing(&err) {
+            return error(StatusCode::NOT_FOUND, "no such session", headers);
+        }
         let msg = if err.is_empty() {
             "capture-pane failed"
         } else {
@@ -543,7 +530,7 @@ fn header_int(headers: &HeaderMap, name: &str) -> Option<Result<i128, ()>> {
 }
 
 async fn stream_pane(name: &str, headers: &HeaderMap) -> Response<Body> {
-    if !text::is_safe_tmux_name(name) {
+    if !target::is_safe(name) {
         return error(StatusCode::BAD_REQUEST, "invalid session name", headers);
     }
     if let (Some(c), Some(r)) = (
@@ -566,7 +553,18 @@ async fn stream_pane(name: &str, headers: &HeaderMap) -> Response<Body> {
     }
     // One-time copy-mode exit on connect (not repeated: it would yank the
     // Mac terminal back to the bottom every frame).
-    run_cmd(&["tmux", "send-keys", "-t", name, "-X", "cancel"], 2.0).await;
+    run_cmd(
+        &[
+            "tmux",
+            "send-keys",
+            "-t",
+            &target::pane(name),
+            "-X",
+            "cancel",
+        ],
+        2.0,
+    )
+    .await;
 
     let (tx, body) = sse::channel();
     tokio::spawn(frame_loop(name.to_string(), tx));
@@ -589,19 +587,20 @@ async fn frame_loop(name: String, tx: tokio::sync::mpsc::Sender<Bytes>) {
     let mut last_dims: Option<String> = None;
     let mut first_frame_sent = false;
     let started = now();
+    let t = target::pane(&name);
     loop {
         let (both, _, rc) = run_cmd(
             &[
                 "tmux",
                 "display-message",
                 "-t",
-                &name,
+                &t,
                 "-p",
                 "#{window_width}x#{window_height}",
                 ";",
                 "capture-pane",
                 "-t",
-                &name,
+                &t,
                 "-p",
                 "-e",
                 "-J",
@@ -679,8 +678,9 @@ fn marker() -> String {
 /// per-session fallback if a session vanished mid-batch.
 async fn capture_panes(names: &[String]) -> Vec<String> {
     let marker = marker();
+    let targets: Vec<String> = names.iter().map(|n| target::pane(n)).collect();
     let mut args: Vec<&str> = vec!["tmux"];
-    for n in names {
+    for n in &targets {
         args.extend([
             "capture-pane",
             "-p",
@@ -704,7 +704,7 @@ async fn capture_panes(names: &[String]) -> Vec<String> {
             .collect();
     }
     let mut res = Vec::with_capacity(names.len());
-    for n in names {
+    for n in &targets {
         res.push(
             run_cmd(&["tmux", "capture-pane", "-t", n, "-p"], 10.0)
                 .await
@@ -768,56 +768,63 @@ async fn get_sessions() -> J {
 
 // ── POST /api/scroll, /api/send, /api/send-key ────────────────────────────
 
-/// `body.get(key, "")` that must be a str (`.strip()` / subprocess arg);
-/// `Err` = the Python handler raised.
-fn get_str<'a>(body: &'a serde_json::Map<String, Value>, key: &str) -> Result<&'a str, ()> {
-    match body.get(key) {
-        None => Ok(""),
-        Some(Value::String(s)) if !s.contains('\0') => Ok(s),
-        Some(_) => Err(()),
+type Handled = Result<Response<Body>, BadRequest>;
+
+/// A tmux command on a target failed: 404 when the pane isn't there,
+/// else a 500 carrying tmux's message.
+fn tmux_failure(err: &str, fallback: &str, headers: &HeaderMap) -> Response<Body> {
+    if target::is_missing(err) {
+        return error(StatusCode::NOT_FOUND, "no such session", headers);
     }
+    let msg = if err.is_empty() { fallback } else { err };
+    error(StatusCode::INTERNAL_SERVER_ERROR, msg, headers)
 }
 
-/// `int(body.get("ticks", 1))` clamped to 1..50; unparsable → 1.
-fn ticks_of(v: Option<&Value>) -> Result<i64, ()> {
+/// `int(body.get("ticks", 1))` clamped to 1..50; unparsable → 1 (as the
+/// Python handler's fallback); a non-finite float → 400.
+fn ticks_of(v: Option<&Py>) -> Result<i64, BadRequest> {
     let n: i128 = match v {
-        None => 1,
-        Some(Value::Bool(b)) => *b as i128,
-        Some(Value::Number(n)) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
-            (Some(i), _, _) => i as i128,
-            (_, Some(u), _) => u as i128,
-            (_, _, Some(f)) if f.is_finite() => f.trunc().clamp(-1e30, 1e30) as i128,
-            _ => return Err(()), // int(inf) → OverflowError
-        },
-        Some(Value::String(s)) => text::py_int_str(s).unwrap_or(1),
+        None | Some(Py::None) => 1,
+        Some(Py::Bool(b)) => *b as i128,
+        Some(Py::Int(i)) => *i,
+        Some(Py::Float(f)) if f.is_finite() => f.trunc().clamp(-1e30, 1e30) as i128,
+        Some(Py::Float(_)) => return Err(BadRequest::new("field 'ticks' must be finite")),
+        Some(Py::Str(s)) => text::py_int_str(s).unwrap_or(1),
         Some(_) => 1,
     };
     Ok(n.clamp(1, 50) as i64)
 }
 
-async fn scroll(
-    state: &State,
-    body: &serde_json::Map<String, Value>,
-    headers: &HeaderMap,
-) -> Response<Body> {
-    let (Ok(session), Ok(direction)) = (get_str(body, "session"), get_str(body, "direction"))
-    else {
-        return internal_error(headers);
-    };
-    let session = strip(session);
-    let direction = strip(direction).to_lowercase();
-    let Ok(ticks) = ticks_of(body.get("ticks")) else {
-        return internal_error(headers);
-    };
+/// The `session` of a tmux POST: a string naming a session (400 otherwise).
+fn session_of<'a>(f: &Fields<'a>) -> Result<&'a str, BadRequest> {
+    let session = strip(f.str_or("session", "")?);
+    if session.is_empty() {
+        return Err(BadRequest::new("session required"));
+    }
+    if !target::is_safe(session) {
+        return Err(BadRequest::new("invalid session name"));
+    }
+    Ok(session)
+}
+
+async fn scroll(state: &State, body: &Py, headers: &HeaderMap) -> Handled {
+    let f = Fields(body);
+    let session = strip(f.str_or("session", "")?);
+    let direction = strip(f.str_or("direction", "")?).to_lowercase();
+    let ticks = ticks_of(body.get("ticks"))?;
     if session.is_empty() || !matches!(direction.as_str(), "up" | "down") {
-        return error(
+        return Ok(error(
             StatusCode::BAD_REQUEST,
             "session + direction(up|down) required",
             headers,
-        );
+        ));
     }
-    if !text::is_safe_tmux_name(session) {
-        return error(StatusCode::BAD_REQUEST, "invalid session name", headers);
+    if !target::is_safe(session) {
+        return Ok(error(
+            StatusCode::BAD_REQUEST,
+            "invalid session name",
+            headers,
+        ));
     }
     let btn = if direction == "up" { 64 } else { 65 };
     // SGR wheel at the pane centre (Codex routes the wheel by position).
@@ -829,17 +836,23 @@ async fn scroll(
         (rows.div_euclid(2)).max(1)
     );
     let seq = one.repeat(ticks as usize);
-    let (_, err, rc) = run_cmd(&["tmux", "send-keys", "-t", session, "-l", &seq], 3.0).await;
+    let (_, err, rc) = run_cmd(
+        &[
+            "tmux",
+            "send-keys",
+            "-t",
+            &target::pane(session),
+            "-l",
+            &seq,
+        ],
+        3.0,
+    )
+    .await;
     if rc != 0 {
-        let msg = if err.is_empty() {
-            "scroll send failed"
-        } else {
-            &err
-        };
-        return error(StatusCode::INTERNAL_SERVER_ERROR, msg, headers);
+        return Ok(tmux_failure(&err, "scroll send failed", headers));
     }
     bump_session_activity(state, session);
-    json(
+    Ok(json(
         StatusCode::OK,
         &J::Obj(vec![
             ("ok", J::Bool(true)),
@@ -847,7 +860,7 @@ async fn scroll(
             ("direction", J::Str(direction)),
         ]),
         headers,
-    )
+    ))
 }
 
 /// `_focus_terminal_tab`: select the Terminal tab attached to this session
@@ -857,7 +870,14 @@ async fn focus_terminal_tab(name: String) {
         return;
     }
     let (out, _, rc) = run_cmd(
-        &["tmux", "list-clients", "-t", &name, "-F", "#{client_tty}"],
+        &[
+            "tmux",
+            "list-clients",
+            "-t",
+            &target::session(&name),
+            "-F",
+            "#{client_tty}",
+        ],
         2.0,
     )
     .await;
@@ -871,70 +891,69 @@ async fn focus_terminal_tab(name: String) {
     spawn_osascript(&text::focus_tab_script(tty));
 }
 
-async fn send(
-    state: &State,
-    body: &serde_json::Map<String, Value>,
-    headers: &HeaderMap,
-) -> Response<Body> {
-    let (Ok(session), Ok(message)) = (get_str(body, "session"), get_str(body, "message")) else {
-        return internal_error(headers);
-    };
+async fn send(state: &State, body: &Py, headers: &HeaderMap) -> Handled {
+    let f = Fields(body);
+    let session = session_of(&f)?;
+    let message = f.str_or("message", "")?;
+    let t = target::pane(session);
     // Text then Enter as two calls: a batched paste can swallow the Enter.
-    run_cmd(&["tmux", "send-keys", "-t", session, "-l", message], 10.0).await;
+    let (_, err, rc) = run_cmd(
+        &[
+            "tmux",
+            "send-keys",
+            "-t",
+            &t,
+            "-l",
+            &target::literal(message),
+        ],
+        10.0,
+    )
+    .await;
+    if rc != 0 {
+        return Ok(tmux_failure(&err, "send failed", headers));
+    }
     tokio::time::sleep(Duration::from_millis(50)).await;
-    run_cmd(&["tmux", "send-keys", "-t", session, "Enter"], 10.0).await;
+    run_cmd(&["tmux", "send-keys", "-t", &t, "Enter"], 10.0).await;
     tokio::spawn(focus_terminal_tab(session.to_string()));
     bump_session_activity(state, session);
     let _ = state
         .events
         .send(serde_json::json!({"type": "send", "session": session}));
-    ok(headers)
+    Ok(ok(headers))
 }
 
-async fn send_key(
-    state: &State,
-    body: &serde_json::Map<String, Value>,
-    headers: &HeaderMap,
-) -> Response<Body> {
-    let session = body.get("session");
-    let keys = match body.get("keys") {
-        Some(k) if truthy(k) => body.get("keys"),
-        _ => body.get("key"),
+async fn send_key(state: &State, body: &Py, headers: &HeaderMap) -> Handled {
+    let f = Fields(body);
+    // `body.get("keys") or body.get("key")`
+    let keys_field = if f.get("keys").is_some_and(Py::truthy) {
+        "keys"
+    } else {
+        "key"
     };
-    let keys: Option<Value> = match keys {
-        Some(Value::String(s)) => Some(Value::Array(vec![Value::String(s.clone())])),
-        other => other.cloned(),
-    };
-    let (Some(session), Some(keys)) = (session.filter(|s| truthy(s)), keys.filter(truthy)) else {
-        return error(
+    let session = strip(f.str_or("session", "")?);
+    if session.is_empty() || !f.get(keys_field).is_some_and(Py::truthy) {
+        return Ok(error(
             StatusCode::BAD_REQUEST,
             "session and keys required",
             headers,
-        );
-    };
-    let keys: Vec<Value> = match keys {
-        Value::Array(a) => a,
-        Value::Object(o) => o.keys().map(|k| Value::String(k.clone())).collect(),
-        _ => return internal_error(headers), // iterating an int/bool raised
-    };
-    let Value::String(session) = session else {
-        return internal_error(headers);
-    };
-    let keys: Vec<String> = keys.iter().map(text::py_str).collect();
-    if session.contains('\0') || keys.iter().any(|k| k.contains('\0')) {
-        return internal_error(headers);
+        ));
     }
-    let mut args: Vec<&str> = vec!["tmux", "send-keys", "-t", session];
-    args.extend(keys.iter().map(String::as_str));
+    if !target::is_safe(session) {
+        return Ok(error(
+            StatusCode::BAD_REQUEST,
+            "invalid session name",
+            headers,
+        ));
+    }
+    let keys = f.strs(keys_field)?.unwrap_or_default();
+    let t = target::pane(session);
+    let keys: Vec<std::borrow::Cow<str>> = keys.iter().map(|k| target::literal(k)).collect();
+    let mut args: Vec<&str> = vec!["tmux", "send-keys", "-t", &t];
+    args.extend(keys.iter().map(|k| k.as_ref()));
     let (_, err, rc) = run_cmd(&args, 5.0).await;
     if rc != 0 {
-        let msg = if err.is_empty() {
-            "send-keys failed"
-        } else {
-            &err
-        };
-        return error(StatusCode::INTERNAL_SERVER_ERROR, msg, headers);
+        return Ok(tmux_failure(&err, "send-keys failed", headers));
     }
     bump_session_activity(state, session);
-    ok(headers)
+    Ok(ok(headers))
 }

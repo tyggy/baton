@@ -1,7 +1,8 @@
 //! Pass-through to the Python reference server for every endpoint the
 //! daemon doesn't implement yet (PLAN.md: strangler migration). Bodies are
 //! streamed both ways, so SSE endpoints (events, tail, pane-stream) work
-//! unchanged and nothing is buffered.
+//! unchanged and nothing is buffered — except a POST body a native handler
+//! has already read to validate it (`forward_bytes`).
 
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
@@ -26,7 +27,7 @@ const HOP: [&str; 7] = [
 
 #[derive(Clone)]
 pub struct Upstream {
-    client: Client<HttpConnector, Incoming>,
+    client: Client<HttpConnector, Body>,
     base: String,
 }
 
@@ -43,7 +44,21 @@ impl Upstream {
         }
     }
 
-    pub async fn forward(&self, mut req: Request<Incoming>) -> Response<Body> {
+    pub async fn forward(&self, req: Request<Incoming>) -> Response<Body> {
+        self.send(req.map(BodyExt::boxed)).await
+    }
+
+    /// Forward a request whose body was already read.
+    pub async fn forward_bytes(
+        &self,
+        parts: hyper::http::request::Parts,
+        body: Bytes,
+    ) -> Response<Body> {
+        let body = Full::new(body).map_err(|never| match never {}).boxed();
+        self.send(Request::from_parts(parts, body)).await
+    }
+
+    async fn send(&self, mut req: Request<Body>) -> Response<Body> {
         let pq = req
             .uri()
             .path_and_query()
