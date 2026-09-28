@@ -800,6 +800,17 @@ def asset_policy(ctx):
     # INC-051 is about non-UTF-8 (latin-1) names, which APFS can't store;
     # this covers the non-ASCII UTF-8 case.
     ctx.expect(r.status == 200 and r.body == b"unicode name\n", f"non-ASCII file name → {r.status}")
+    # macOS screenshot names carry U+202F before AM/PM — outside latin-1,
+    # which the Content-Disposition header used to require (500).
+    shot = w.home / "Documents/Screenshot 2026-06-21 at 1.35.34 PM.png"
+    shot.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    try:
+        r = a(shot)
+        cd = r.headers.get("content-disposition", "")
+        ctx.expect(r.status == 200 and "filename*=UTF-8''" in cd and "%E2%80%AF" in cd,
+                   f"screenshot name (U+202F) → {r.status} ({cd[:90]!r})", known={"python": "NEW-4"})
+    finally:
+        shot.unlink()
     r = a(w.home / "Documents/big.md")
     et = r.headers.get("etag")
     ctx.expect(r.status == 200 and bool(et), f"text asset 200 with ETag ({r.status})")

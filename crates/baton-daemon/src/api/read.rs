@@ -598,13 +598,32 @@ async fn asset(path: Option<String>, req: &HeaderMap) -> Response<Body> {
         return send_json(500, &core::internal_error(), req);
     };
     let disposition = |name: &str| -> Option<hyper::header::HeaderValue> {
-        // Python encodes header values as latin-1; names outside it made
-        // the reference server fail the request.
-        let latin1: Option<Vec<u8>> = format!("inline; filename=\"{name}\"")
+        // RFC 6266: an ASCII `filename` plus the exact UTF-8 name in
+        // `filename*`. (Python sent latin-1 only and failed the request
+        // for anything else — every macOS screenshot, whose name has a
+        // U+202F before "AM"/"PM", got a 500.)
+        let ascii: String = name
             .chars()
-            .map(|c| u8::try_from(c as u32).ok())
+            .map(|c| {
+                if c.is_ascii_graphic() && c != '"' && c != '\\' || c == ' ' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
-        hyper::header::HeaderValue::from_bytes(&latin1?).ok()
+        let mut v = format!("inline; filename=\"{ascii}\"");
+        if !name.is_ascii() {
+            v.push_str("; filename*=UTF-8''");
+            for b in name.bytes() {
+                if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+                    v.push(b as char);
+                } else {
+                    v.push_str(&format!("%{b:02X}"));
+                }
+            }
+        }
+        hyper::header::HeaderValue::from_str(&v).ok()
     };
     match plan {
         Plan::Json(status, v) => send_json(status, &v, req),
