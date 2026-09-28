@@ -61,6 +61,7 @@ async fn serve(args: &[String]) {
     let upstream_url = arg(args, "--upstream", "http://127.0.0.1:19877");
     let state = Arc::new(state::State::new(proxy::Upstream::new(&upstream_url)));
     let listener = TcpListener::bind(listen).await.expect("bind");
+    tokio::spawn(api::list::prewarm(state.clone()));
     eprintln!(
         "baton serve on {listen} (upstream {upstream_url}, auth {})",
         if state.token.is_empty() { "off" } else { "on" }

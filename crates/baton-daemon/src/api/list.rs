@@ -143,6 +143,19 @@ pub async fn route(state: &Arc<State>, req: Request<Incoming>) -> Routed {
     })
 }
 
+/// Build the list (cold, parallel parse) and a second time (per-file
+/// incremental state) at daemon start, so the first phone request after a
+/// restart doesn't pay for either (Python's `_prewarm` equivalent). Phone
+/// A/B: cold list 1383/1140 ms on the first two journeys without this, then
+/// 393/281 ms.
+pub async fn prewarm(state: Arc<State>) {
+    let t0 = std::time::Instant::now();
+    let eng = engine(&state).await;
+    let _ = eng.payload(None).await;
+    let _ = eng.force_rebuild().await;
+    eprintln!("list prewarm done in {} ms", t0.elapsed().as_millis());
+}
+
 async fn engine(state: &Arc<State>) -> Arc<Engine> {
     ENGINE
         .get_or_init(|| async {
