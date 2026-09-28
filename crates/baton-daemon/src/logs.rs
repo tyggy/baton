@@ -39,7 +39,7 @@ static LOG_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn dir() -> PathBuf {
     let d = match std::env::var_os("BATON_LOG_DIR") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
+        Some(d) if !d.is_empty() => crate::expand_home(&d.to_string_lossy()),
         _ => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Library/Logs"),
     };
     let _ = std::fs::create_dir_all(&d);
