@@ -108,9 +108,15 @@ def codex_records(sid, cwd, n, start, tag, source="cli", parent=None):
     return out
 
 
+def compact(r):
+    """Transcripts are written compact (`"type":"assistant"`); the servers'
+    byte-level prefilters depend on that."""
+    return json.dumps(r, separators=(",", ":"), ensure_ascii=False).encode()
+
+
 def dump(path, recs, extra=b""):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"".join(json.dumps(r).encode() + b"\n" for r in recs) + extra)
+    path.write_bytes(b"".join(compact(r) + b"\n" for r in recs) + extra)
 
 
 def rollout_path(home, sid, day):
@@ -185,7 +191,12 @@ class World:
         env.update(HOME=str(self.home), TMUX_TMPDIR=str(self.tdir), SHELL="/bin/sh",
                    TMPDIR=str(self.root) + "/", PYTHONDONTWRITEBYTECODE="1",
                    PATH=f"{self.fakes}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-                   BATON_DISABLE_CLASSIFY="1", REGRESS_ARGV_LOG=str(self.argv_log))
+                   BATON_DISABLE_CLASSIFY="1", REGRESS_ARGV_LOG=str(self.argv_log), HISTFILE="/dev/null")
+        # Python's `markdown` lives in the user site-packages, which Python
+        # finds through HOME; keep it visible with the sandbox HOME.
+        ub = HOME / "Library/Python/3.11"
+        if ub.is_dir():
+            env["PYTHONUSERBASE"] = str(ub)
         env.setdefault("LANG", "en_US.UTF-8")
         env.update(extra)
         return env
@@ -246,7 +257,7 @@ class World:
              claude_records(I["CL_HEADLESS"], cwd, 24, t(42), "headless-run", entrypoint="sdk-cli"))
         dump(self.claude_file(I["CL_BADUTF"]), claude_records(I["CL_BADUTF"], cwd, 21, t(40), "badutf"),
              extra=b'{"type":"user","message":{"role":"user","content":"bad \xff\xfe bytes"}}\n'
-             + b"".join(json.dumps(r).encode() + b"\n" for r in claude_records(I["CL_BADUTF"], cwd, 2, t(39), "badutf-after")))
+             + b"".join(compact(r) + b"\n" for r in claude_records(I["CL_BADUTF"], cwd, 2, t(39), "badutf-after")))
         # Clean at start; the INC-037 check appends the malformed lines (and
         # removes them again) so one bad record can't take the whole run down.
         dump(self.claude_file(I["CL_MALFORMED"]), claude_records(I["CL_MALFORMED"], cwd, 21, t(38), "malformed"))
@@ -354,6 +365,7 @@ class World:
                 pass
         if self.tdir.is_dir():
             self.tmux("kill-server")
+            time.sleep(0.3)     # let the panes' shells exit before the tree goes
         if not self.keep:
             shutil.rmtree(self.root, ignore_errors=True)
             shutil.rmtree(self.tdir, ignore_errors=True)

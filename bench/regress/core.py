@@ -163,6 +163,7 @@ class SSE:
                 if rst:  # abortive close: RST instead of FIN
                     import struct
                     c.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                    c.sock.shutdown(socket.SHUT_RD)   # wakes the reader thread, sends nothing
                     c.sock.close()
                 else:
                     c.sock.shutdown(socket.SHUT_RDWR)
