@@ -45,7 +45,17 @@ struct StatusPane: View {
                 }
                 StatusRow(title: "Documents folder", reason: "Optional. Lets your iPhone open files and notes kept in Documents.",
                           status: permissions.documents) {
-                    Button("Check") { permissions.refreshDocuments() }
+                    Button("Check") { permissions.refreshFolder("Documents") }
+                    Button("Settings…") { SettingsLink.open(SettingsLink.files) }
+                }
+                StatusRow(title: "Downloads folder", reason: "Optional. Lets your iPhone open files in Downloads that sessions mention (CSV exports, PDFs).",
+                          status: permissions.downloads) {
+                    Button("Check") { permissions.refreshFolder("Downloads") }
+                    Button("Settings…") { SettingsLink.open(SettingsLink.files) }
+                }
+                StatusRow(title: "Desktop folder", reason: "Optional. Lets your iPhone open files on your Desktop that sessions mention.",
+                          status: permissions.desktop) {
+                    Button("Check") { permissions.refreshFolder("Desktop") }
                     Button("Settings…") { SettingsLink.open(SettingsLink.files) }
                 }
                 Toggle(isOn: Binding(

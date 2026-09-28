@@ -34,12 +34,14 @@ enum SettingsLink {
 final class Permissions: ObservableObject {
     @Published var automation = CheckStatus.checking
     @Published var documents = CheckStatus.checking
+    @Published var downloads = CheckStatus.checking
+    @Published var desktop = CheckStatus.checking
     @Published var accessibility = CheckStatus.checking
     @Published var notifications = CheckStatus.checking
 
     /// Documents check is only run on demand (onboarding open / Recheck): on
     /// first run it shows the system prompt.
-    private var documentsProbeInFlight = false
+    private var probesInFlight: Set<String> = []
 
     /// Only Terminal access is required; the rest are optional extras.
     var requiredMissing: Bool { automation.level != .ok }
@@ -48,7 +50,7 @@ final class Permissions: ObservableObject {
         refreshAutomation(ask: false)
         refreshAccessibility()
         Task { await refreshNotifications() }
-        if includeDocuments { refreshDocuments() }
+        if includeDocuments { refreshFolders() }
     }
 
     // MARK: Automation → Terminal
@@ -92,13 +94,31 @@ final class Permissions: ObservableObject {
         }
     }
 
-    // MARK: Files & Folders → Documents
+    // MARK: Files & Folders → Documents, Downloads, Desktop
 
-    func refreshDocuments() {
-        guard !documentsProbeInFlight else { return }
-        documentsProbeInFlight = true
-        documents = CheckStatus(level: .checking, detail: "Checking…")
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents").path
+    /// Each protected folder is its own grant. The daemon runs as Baton, so
+    /// a folder not granted here makes its reads wait on a prompt (it
+    /// skips them instead — baton-core tcc.rs); listing it from the app
+    /// asks once, with the app in front.
+    func refreshFolders() {
+        for name in ["Documents", "Downloads", "Desktop"] { refreshFolder(name) }
+    }
+
+    func refreshDocuments() { refreshFolder("Documents") }
+
+    private func set(_ name: String, _ st: CheckStatus) {
+        switch name {
+        case "Downloads": downloads = st
+        case "Desktop": desktop = st
+        default: documents = st
+        }
+    }
+
+    func refreshFolder(_ name: String) {
+        guard !probesInFlight.contains(name) else { return }
+        probesInFlight.insert(name)
+        set(name, CheckStatus(level: .checking, detail: "Checking…"))
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(name).path
         // The listing runs on its own thread: if TCC blocks it behind a
         // prompt, the thread waits, the UI doesn't.
         let box = ProbeBox()
@@ -112,21 +132,21 @@ final class Permissions: ObservableObject {
                 if posix == Int(EPERM) || e.code == NSFileReadNoPermissionError {
                     result = CheckStatus(level: .pending, detail: "Off")
                 } else if e.code == NSFileReadNoSuchFileError {
-                    result = CheckStatus(level: .ok, detail: "No Documents folder")
+                    result = CheckStatus(level: .ok, detail: "No \(name) folder")
                 } else {
                     result = CheckStatus(level: .pending, detail: e.localizedDescription)
                 }
             }
             box.finish(result)
             Task { @MainActor in
-                self.documents = result
-                self.documentsProbeInFlight = false
+                self.set(name, result)
+                self.probesInFlight.remove(name)
             }
         }
         Task {
             try? await Task.sleep(for: .seconds(3))
             if !box.done {
-                self.documents = CheckStatus(level: .pending, detail: "Waiting for approval")
+                self.set(name, CheckStatus(level: .pending, detail: "Waiting for approval"))
             }
         }
     }
