@@ -1,6 +1,16 @@
 import Foundation
 import ServiceManagement
 
+/// The daemon's ports — the one place they are spelled out on the Mac side
+/// (the daemon's own default lives in `crates/baton-daemon/src/config.rs`).
+enum BatonPorts {
+    /// The default port (`DEFAULT_PORT`): what phones connect to.
+    static let standard = 19877
+    /// The daemon beside the Python server, which keeps `standard` until
+    /// the cut-over (`SIDECAR_PORT`, docs/migrating.md).
+    static let sidecar = 19880
+}
+
 /// Hosts `baton serve` as a LaunchAgent registered through SMAppService, so
 /// the daemon runs under this app's identity (TCC prompts are attributed to
 /// Baton, not to an anonymous launchd job — see docs/incidents.md INC-002).
@@ -48,8 +58,8 @@ final class DaemonController: ObservableObject {
 
     // MARK: config
 
-    static let defaultListen = "127.0.0.1:19880"
-    static let defaultUpstream = "http://127.0.0.1:19877"
+    static let defaultListen = "127.0.0.1:\(BatonPorts.sidecar)"
+    static let defaultUpstream = "http://127.0.0.1:\(BatonPorts.standard)"
 
     var listen: String {
         get { UserDefaults.standard.string(forKey: "daemon.listen") ?? Self.defaultListen }
@@ -61,7 +71,9 @@ final class DaemonController: ObservableObject {
     }
 
     /// Port the daemon listens on (for pairing / tailscale serve hints).
-    var listenPort: String { listen.split(separator: ":").last.map(String.init) ?? "19880" }
+    var listenPort: String {
+        listen.split(separator: ":").last.map(String.init) ?? String(BatonPorts.sidecar)
+    }
 
     static var configURL: URL {
         FileManager.default.homeDirectoryForCurrentUser

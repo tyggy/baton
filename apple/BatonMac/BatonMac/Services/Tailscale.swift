@@ -53,7 +53,7 @@ struct TailscaleInfo: Equatable {
         return info
     }
 
-    /// Collect every `Proxy` value (e.g. "http://127.0.0.1:19877") in the
+    /// Collect every `Proxy` value (e.g. "http://127.0.0.1:<port>") in the
     /// serve config, wherever it sits (Web → host → Handlers → path).
     static func proxyTargets(_ any: Any) -> [String] {
         var out: [String] = []

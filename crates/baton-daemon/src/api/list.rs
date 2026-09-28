@@ -177,7 +177,7 @@ async fn engine(state: &Arc<State>) -> Arc<Engine> {
                 lb: ListBuilder::new(baton_core::sessions::Dirs::default_home()),
                 home: state.home.clone(),
                 csm_dir: Mutex::new((None, None)),
-                upstream: Upstream::new(state.token.clone()),
+                upstream: Upstream::new(state.config.upstream.clone(), state.token.clone()),
                 build_lock: Mutex::new(()),
                 cache: Mutex::default(),
                 inflight: Mutex::default(),
@@ -614,15 +614,10 @@ struct Upstream {
 }
 
 impl Upstream {
-    fn new(token: String) -> Self {
-        // Same flag `baton serve` reads (main.rs); default matches it.
-        let args: Vec<String> = std::env::args().collect();
-        let base = args
-            .iter()
-            .position(|a| a == "--upstream")
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-            .unwrap_or_else(|| "http://127.0.0.1:19877".into());
+    /// `base`: the configured upstream (`None` = no upstream; every GET
+    /// then yields nothing).
+    fn new(base: Option<String>, token: String) -> Self {
+        let base = base.unwrap_or_default();
         Upstream {
             client: hyper_util::client::legacy::Client::builder(
                 hyper_util::rt::TokioExecutor::new(),
@@ -634,6 +629,9 @@ impl Upstream {
     }
 
     async fn open(&self, path: &str) -> Option<Incoming> {
+        if self.base.is_empty() {
+            return None;
+        }
         let mut b = Request::get(format!("{}{}", self.base, path));
         if !self.token.is_empty() {
             b = b.header("authorization", format!("Bearer {}", self.token));

@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct State {
-    /// Bearer token (empty = dev mode, no auth) — from `BATON_BEARER` or
-    /// `~/.claude-sessions/config`, the same source the Python server uses.
+    /// Bearer token (empty = dev mode, no auth) — see [`load_token`].
     pub token: String,
+    pub config: crate::config::Config,
     pub home: PathBuf,
     pub dirs: Dirs,
     pub upstream: crate::proxy::Upstream,
@@ -26,14 +26,16 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(upstream: crate::proxy::Upstream, relay: Option<String>) -> Self {
+    pub fn new(config: crate::config::Config) -> Self {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();
         let (events, _) = tokio::sync::broadcast::channel(256);
-        let push = std::sync::Arc::new(crate::push::Push::from_env(&home, relay));
+        let push = std::sync::Arc::new(crate::push::Push::from_env(&home, config.relay.clone()));
+        let upstream = crate::proxy::Upstream::new(config.upstream.as_deref());
         State {
-            token: load_token(&home),
+            token: load_token(&home).0,
+            config,
             dirs: Dirs::default_home(),
             home,
             upstream,
@@ -56,15 +58,49 @@ impl State {
     }
 }
 
-fn load_token(home: &std::path::Path) -> String {
+/// Where the bearer token came from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TokenSource {
+    Env,
+    File(PathBuf),
+    /// `BATON_BEARER=` in `~/.claude-sessions/config` (the Python server's).
+    Legacy(PathBuf),
+    None,
+}
+
+/// The bearer token: `BATON_BEARER`, else the token file `baton setup`
+/// writes (`~/.config/baton/token`), else the Python server's
+/// `~/.claude-sessions/config`. Empty = auth off.
+pub fn load_token(home: &std::path::Path) -> (String, TokenSource) {
     if let Ok(t) = std::env::var("BATON_BEARER") {
-        return t.trim().to_string();
+        return (t.trim().to_string(), TokenSource::Env);
     }
-    let cfg = std::fs::read_to_string(home.join(".claude-sessions/config")).unwrap_or_default();
+    let file = crate::config::token_path();
+    if let Ok(t) = std::fs::read_to_string(&file) {
+        let t = t.trim();
+        if !t.is_empty() {
+            return (t.to_string(), TokenSource::File(file));
+        }
+    }
+    let legacy = legacy_config(home);
+    match legacy_value(&legacy, "BATON_BEARER") {
+        Some(t) if !t.is_empty() => (t, TokenSource::Legacy(legacy)),
+        _ => (String::new(), TokenSource::None),
+    }
+}
+
+/// The Python server's env file.
+pub fn legacy_config(home: &std::path::Path) -> PathBuf {
+    home.join(".claude-sessions/config")
+}
+
+/// `NAME=value` (optionally `export`ed, quoted) from a shell env file.
+pub fn legacy_value(path: &std::path::Path, name: &str) -> Option<String> {
+    let cfg = std::fs::read_to_string(path).ok()?;
+    let pfx = format!("{name}=");
     cfg.lines()
         .map(|l| l.trim().trim_start_matches("export ").trim())
-        .filter_map(|l| l.strip_prefix("BATON_BEARER="))
+        .filter_map(|l| l.strip_prefix(pfx.as_str()))
         .next_back()
         .map(|v| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
-        .unwrap_or_default()
 }

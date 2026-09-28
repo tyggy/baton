@@ -52,12 +52,13 @@ impl Inputs {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         let prefix = format!("-Users-{user}-Documents-");
+        let settings = crate::settings::get();
         let mut area_map: HashMap<String, Value> = HashMap::new();
-        area_map.insert(
-            format!("{prefix}GitHub-workbench-exporter-master"),
-            Value::from("Exporter"),
-        );
         area_map.insert(format!("-Users-{user}"), Value::from("Home"));
+        // `project_groups` from the config (docs/config.md).
+        for (k, v) in &settings.project_groups {
+            area_map.insert(crate::settings::group_key(k, home), Value::from(v.as_str()));
+        }
         let mut scores = Map::new();
         if let Some(dir) = &cfg.csm_dir {
             if let Some(Value::Object(m)) = read_json(&dir.join("area_map.json")) {
@@ -71,35 +72,40 @@ impl Inputs {
             scores = object(read_json(&dir.join("session_scores.json")));
         }
         let tmux = crate::tmuxmap::detect(home, claude_dir);
-        let catalog_by_id = match read_json(&home.join(".baton/entities.json")) {
-            Some(Value::Array(list)) => {
-                let mut m = HashMap::new();
-                let mut ok = true;
-                for e in list {
-                    match e.get("id") {
-                        Some(Value::String(id)) => {
-                            m.insert(id.clone(), e);
-                        }
-                        Some(_) => {}
-                        None => {
-                            ok = false; // KeyError: the whole comprehension fails
-                            break;
+        // The entity catalog is an opt-in integration (`entities = true`).
+        let entities_on = settings.entities;
+        let catalog_by_id =
+            match read_json(&home.join(".baton/entities.json")).filter(|_| entities_on) {
+                Some(Value::Array(list)) => {
+                    let mut m = HashMap::new();
+                    let mut ok = true;
+                    for e in list {
+                        match e.get("id") {
+                            Some(Value::String(id)) => {
+                                m.insert(id.clone(), e);
+                            }
+                            Some(_) => {}
+                            None => {
+                                ok = false; // KeyError: the whole comprehension fails
+                                break;
+                            }
                         }
                     }
+                    if ok {
+                        m
+                    } else {
+                        HashMap::new()
+                    }
                 }
-                if ok {
-                    m
-                } else {
-                    HashMap::new()
-                }
-            }
-            _ => HashMap::new(),
-        };
+                _ => HashMap::new(),
+            };
         Inputs {
             scores,
             classifications: load_classifications(home),
             area_map,
-            entity_index: object(read_json(&home.join(".baton/session_entities.json"))),
+            entity_index: object(
+                read_json(&home.join(".baton/session_entities.json")).filter(|_| entities_on),
+            ),
             catalog_by_id,
             lineage: object(read_json(&home.join(".baton/session_lineage.json"))),
             tmux,
@@ -111,7 +117,7 @@ impl Inputs {
 /// malformed entry makes Python fall back to `{}`.
 fn load_classifications(home: &Path) -> Map<String, Value> {
     let Some(Value::Object(mut cache)) =
-        read_json(&home.join(".claude/session_classifications.json"))
+        read_json(&crate::settings::claude_dir(home).join("session_classifications.json"))
     else {
         return Map::new();
     };

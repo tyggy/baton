@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# Library + dev tools (baton-parse, baton-pymd): not shipped.
+[package.metadata.dist]
+dist = false
+
 [dependencies]
 serde_json.workspace = true
 regex = "1"

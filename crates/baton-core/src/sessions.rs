@@ -18,8 +18,8 @@ impl Dirs {
             .map(PathBuf::from)
             .unwrap_or_default();
         Dirs {
-            claude: home.join(".claude/projects"),
-            codex: home.join(".codex/sessions"),
+            claude: crate::settings::claude_dir(&home).join("projects"),
+            codex: crate::settings::codex_dir(&home).join("sessions"),
         }
     }
 }

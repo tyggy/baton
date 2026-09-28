@@ -72,7 +72,9 @@ fn py_int(s: &str) -> Option<i64> {
 /// `tty_session_map.json` → {tty: session_id} for entries under 7 days old.
 /// A malformed `ts` ends the scan (Python raised there, keeping what it had).
 fn tty_map(home: &Path) -> Option<HashMap<String, String>> {
-    let text = std::fs::read_to_string(home.join(".claude/tty_session_map.json")).ok()?;
+    let text =
+        std::fs::read_to_string(crate::settings::claude_dir(home).join("tty_session_map.json"))
+            .ok()?;
     let data: Value = serde_json::from_str(&text).ok()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

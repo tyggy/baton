@@ -495,12 +495,11 @@ impl RelayClient {
         }
     }
 
-    /// Resolve the relay URL: `BATON_RELAY_URL`, else the `relay=` config
-    /// value. Empty or missing = push disabled.
+    /// The relay URL as resolved by the config (`--relay` >
+    /// `BATON_RELAY_URL` > `relay` in the config file). Empty or missing =
+    /// push disabled.
     pub fn from_env(config_value: Option<String>) -> Option<Self> {
-        let url = std::env::var("BATON_RELAY_URL")
-            .ok()
-            .or(config_value)
+        let url = config_value
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())?;
         if !(url.starts_with("https://") || url.starts_with("http://")) {
@@ -962,10 +961,6 @@ mod tests {
 
     #[test]
     fn push_relay_url_config() {
-        // BATON_RELAY_URL is not set in the test environment.
-        if std::env::var_os("BATON_RELAY_URL").is_some() {
-            return;
-        }
         assert!(RelayClient::from_env(None).is_none());
         assert!(RelayClient::from_env(Some("  ".into())).is_none());
         assert!(RelayClient::from_env(Some("ftp://x".into())).is_none());

@@ -28,11 +28,13 @@ const HOP: [&str; 7] = [
 #[derive(Clone)]
 pub struct Upstream {
     client: Client<HttpConnector, Body>,
+    /// Empty = no upstream: unimplemented endpoints answer 501.
     base: String,
 }
 
 impl Upstream {
-    pub fn new(base: &str) -> Self {
+    pub fn new(base: Option<&str>) -> Self {
+        let base = base.unwrap_or("");
         let mut conn = HttpConnector::new();
         conn.set_nodelay(true);
         let client = Client::builder(TokioExecutor::new())
@@ -59,6 +61,16 @@ impl Upstream {
     }
 
     async fn send(&self, mut req: Request<Body>) -> Response<Body> {
+        if self.base.is_empty() {
+            return error(
+                StatusCode::NOT_IMPLEMENTED,
+                &format!(
+                    "{} {} is not implemented by the baton daemon (no upstream configured; see docs/config.md)",
+                    req.method(),
+                    req.uri().path()
+                ),
+            );
+        }
         let pq = req
             .uri()
             .path_and_query()

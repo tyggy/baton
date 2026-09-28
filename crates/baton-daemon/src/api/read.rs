@@ -220,8 +220,10 @@ fn preview_cached(c: &ReadConfig, sid: &str, path: &PathBuf, limit: i64) -> prev
     static MEMO: OnceLock<Mutex<Vec<(Key, Value)>>> = OnceLock::new();
     use std::os::unix::fs::MetadataExt;
     let key = std::fs::metadata(path).ok().map(|m| {
-        let cache_state = core::paths::glob(&c.sessions_cache_dir, &format!("*/{sid}.md"))
-            .ok()
+        let cache_state = c
+            .sessions_cache_dir
+            .as_ref()
+            .and_then(|d| core::paths::glob(d, &format!("*/{sid}.md")).ok())
             .and_then(|v| v.into_iter().next())
             .and_then(|p| std::fs::metadata(&p).ok().map(|m| (p, m)))
             .map(|(p, m)| {

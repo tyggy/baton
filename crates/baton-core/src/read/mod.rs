@@ -95,7 +95,9 @@ pub struct ReadConfig {
     pub home: String,
     pub claude_projects: PathBuf,
     pub codex_sessions: PathBuf,
-    pub sessions_cache_dir: PathBuf,
+    /// Markdown exports of sessions (`<kb>/sessions.nosync`), used as a
+    /// preview cache when present. `None` without a knowledge base.
+    pub sessions_cache_dir: Option<PathBuf>,
     pub assets: AssetPolicy,
 }
 
@@ -142,14 +144,30 @@ impl ReadConfig {
             let v = csm_env(name).unwrap_or_else(|| default.to_string());
             assets::pathlib_str(&paths::expanduser(&v, &home))
         };
-        let base = env_path("CSM_BASE_PATH", "~/Documents/Claude");
-        let cache = env_path("CSM_SESSIONS_CACHE_DIR", &format!("{base}/sessions.nosync"));
-        let roots = csm_env("CSM_ASSET_ROOTS");
+        let settings = crate::settings::get();
+        // Env (the Python server's names) wins over the config file.
+        let base = csm_env("CSM_BASE_PATH")
+            .map(|v| env_path("CSM_BASE_PATH", &v))
+            .or_else(|| {
+                settings
+                    .kb_path
+                    .as_ref()
+                    .map(|p| assets::pathlib_str(&p.to_string_lossy()))
+            });
+        let cache = match csm_env("CSM_SESSIONS_CACHE_DIR") {
+            Some(v) => Some(env_path("CSM_SESSIONS_CACHE_DIR", &v)),
+            None => base.map(|b| format!("{b}/sessions.nosync")),
+        };
+        let assets = match csm_env("CSM_ASSET_ROOTS").filter(|r| !r.trim().is_empty()) {
+            Some(r) => AssetPolicy::new(&home, Some(&r)),
+            None => AssetPolicy::with_roots(&home, settings.asset_roots.clone()),
+        };
+        let home_p = Path::new(&home);
         ReadConfig {
-            claude_projects: Path::new(&home).join(".claude/projects"),
-            codex_sessions: Path::new(&home).join(".codex/sessions"),
-            sessions_cache_dir: PathBuf::from(cache),
-            assets: AssetPolicy::new(&home, roots.as_deref()),
+            claude_projects: crate::settings::claude_dir(home_p).join("projects"),
+            codex_sessions: crate::settings::codex_dir(home_p).join("sessions"),
+            sessions_cache_dir: cache.map(PathBuf::from),
+            assets,
             home,
         }
     }
