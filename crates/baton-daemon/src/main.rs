@@ -7,6 +7,7 @@ mod cmd;
 mod http;
 mod logs;
 mod proxy;
+mod push;
 mod pyjson;
 mod state;
 mod tmux_target;
@@ -18,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-const USAGE: &str = "usage: baton serve [--listen 127.0.0.1:19880] [--upstream http://127.0.0.1:19877] [--config FILE]\n       baton sessions   (session list as JSON)";
+const USAGE: &str = "usage: baton serve [--listen 127.0.0.1:19880] [--upstream http://127.0.0.1:19877] [--relay URL] [--config FILE]\n       baton sessions   (session list as JSON)";
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -90,9 +91,15 @@ async fn serve(args: &[String]) {
         .parse()
         .expect("--listen host:port");
     let upstream_url = arg(args, "--upstream", "http://127.0.0.1:19877");
-    let state = Arc::new(state::State::new(proxy::Upstream::new(&upstream_url)));
+    // Push relay: BATON_RELAY_URL, else --relay / `relay=` in --config.
+    let relay = Some(arg(args, "--relay", "")).filter(|r| !r.is_empty());
+    let state = Arc::new(state::State::new(
+        proxy::Upstream::new(&upstream_url),
+        relay,
+    ));
     let listener = TcpListener::bind(listen).await.expect("bind");
     tokio::spawn(api::list::prewarm(state.clone()));
+    tokio::spawn(state.push.clone().run(state.events.subscribe()));
     eprintln!(
         "baton serve on {listen} (upstream {upstream_url}, auth {})",
         if state.token.is_empty() { "off" } else { "on" }

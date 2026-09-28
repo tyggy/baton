@@ -25,14 +25,17 @@ pub struct State {
     /// list watcher skips rebuilds for 3 s after it (they compete with the
     /// terminal for CPU) — same rule as the Python server.
     pub last_input_ms: AtomicU64,
+    /// Push devices + relay client (push.rs, docs/relay.md).
+    pub push: std::sync::Arc<crate::push::Push>,
 }
 
 impl State {
-    pub fn new(upstream: crate::proxy::Upstream) -> Self {
+    pub fn new(upstream: crate::proxy::Upstream, relay: Option<String>) -> Self {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();
         let (events, _) = tokio::sync::broadcast::channel(256);
+        let push = std::sync::Arc::new(crate::push::Push::from_env(&home, relay));
         State {
             token: load_token(&home),
             dirs: Dirs::default_home(),
@@ -41,6 +44,7 @@ impl State {
             upstream,
             events,
             last_input_ms: AtomicU64::new(0),
+            push,
         }
     }
 
