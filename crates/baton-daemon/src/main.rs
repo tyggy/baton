@@ -50,7 +50,28 @@ fn load_config(args: &[String]) -> config::Config {
     cfg
 }
 
+/// launchd starts agents without LANG/LC_*. tmux then treats its output as
+/// ASCII and prints the tab in `-F '#{a}\t#{b}'` formats as `_`, so every
+/// pane-list parse came back empty and all tmux sessions looked dormant.
+/// Children (tmux, ps, claude, codex) inherit this.
+fn ensure_utf8_locale() {
+    let utf8 = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+        .is_some_and(|v| {
+            let v = v.to_ascii_uppercase();
+            v.contains("UTF-8") || v.contains("UTF8")
+        });
+    if !utf8 {
+        // Single-threaded here: before the tokio runtime or any spawn.
+        std::env::set_var("LANG", "en_US.UTF-8");
+        std::env::remove_var("LC_ALL");
+        std::env::remove_var("LC_CTYPE");
+    }
+}
+
 fn main() {
+    ensure_utf8_locale();
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(String::as_str) {
         Some("sessions") => {

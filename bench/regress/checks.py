@@ -725,6 +725,15 @@ def startup_launchd(ctx):
         hs = wait_http(c, 10)
         ctx.expect(hs is not None, "/api/health 200 within 10 s")
         ctx.note(f"bound after {bound:.2f}s, health after {(hs or 0) + bound:.2f}s")
+        # launchd passes no LANG: tmux then prints the tab in `-F` formats as
+        # `_` and every pane-list parse came back empty (the Mac app's daemon
+        # showed all tmux sessions as dormant). The plist env has no locale,
+        # so the running pane must still map.
+        ctx.expect(not any(k in env for k in ("LANG", "LC_ALL", "LC_CTYPE")), "launchd env carries no locale")
+        r = c.get("/api/local-sessions", timeout=60)
+        row = by_id(r.json()).get(w.ids["CL_RUN"], {}) if r.status == 200 else {}
+        ctx.expect(row.get("tmux_session") == w.panes["claude"],
+                   f"tmux pane maps without a locale (tmux_session={row.get('tmux_session')!r})")
         # second instance on the occupied port: exits non-zero promptly
         out2 = open(w.root / "startup2.err", "w")
         t1 = time.time()
