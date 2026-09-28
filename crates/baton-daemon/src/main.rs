@@ -153,7 +153,7 @@ async fn serve(cfg: config::Config) {
         eprintln!("baton: warning: no bearer token and listening on {listen}; run `baton setup`");
     }
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        let Ok((stream, peer)) = listener.accept().await else {
             continue;
         };
         let _ = stream.set_nodelay(true);
@@ -161,7 +161,7 @@ async fn serve(cfg: config::Config) {
         tokio::spawn(async move {
             let svc = service_fn(move |req| {
                 let state = state.clone();
-                async move { Ok::<_, std::convert::Infallible>(handle(&state, req).await) }
+                async move { Ok::<_, std::convert::Infallible>(handle(&state, req, peer).await) }
             });
             let _ = http1::Builder::new()
                 .keep_alive(true)
@@ -171,16 +171,23 @@ async fn serve(cfg: config::Config) {
     }
 }
 
+/// Every request is logged here, once: native, proxied, refused. Handlers
+/// that need the request id (error records) read `logs::Rid`.
 async fn handle(
     state: &Arc<state::State>,
-    req: hyper::Request<hyper::body::Incoming>,
+    mut req: hyper::Request<hyper::body::Incoming>,
+    peer: SocketAddr,
 ) -> hyper::Response<proxy::Body> {
+    req.extensions_mut().insert(peer);
+    let log = logs::RequestLog::begin(&req);
+    req.extensions_mut().insert(logs::Rid(log.rid.clone()));
     let path = req.uri().path().to_string();
     if let Some(denied) = http::check_auth(req.headers(), &path, &state.token) {
-        return denied;
+        return log.finish(denied);
     }
-    match api::route(state, req).await {
+    let resp = match api::route(state, req).await {
         Ok(resp) => resp,
         Err(req) => state.upstream.forward(req).await,
-    }
+    };
+    log.finish(resp)
 }

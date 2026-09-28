@@ -25,7 +25,7 @@
 use super::Routed;
 use crate::cmd;
 use crate::http::{self, bytes_response, BadRequest, Fields};
-use crate::logs::{self, RequestLog};
+use crate::logs;
 use crate::proxy::Body;
 use crate::pyjson::{head, Py, Style};
 use crate::state::State;
@@ -146,7 +146,11 @@ pub async fn route(state: &Arc<State>, req: Request<Incoming>) -> Routed {
     if ep == Ep::BenchProxy {
         return Ok(bench_proxy(state, req).await);
     }
-    let log = RequestLog::begin(&req);
+    let rid = req
+        .extensions()
+        .get::<logs::Rid>()
+        .map(|r| r.0.clone())
+        .unwrap_or_default();
     let path = req.uri().path().to_string();
     let method = req.method().as_str().to_string();
     let headers = req.headers().clone();
@@ -167,7 +171,7 @@ pub async fn route(state: &Arc<State>, req: Request<Incoming>) -> Routed {
             logs::event(
                 "request_error",
                 vec![
-                    ("rid", Py::str(log.rid.as_str())),
+                    ("rid", Py::str(rid.as_str())),
                     ("path", Py::str(path.as_str())),
                     ("error", Py::str(head(&format!("{typ}({msg:?})"), 300))),
                 ],
@@ -178,7 +182,7 @@ pub async fn route(state: &Arc<State>, req: Request<Incoming>) -> Routed {
                 &msg,
                 vec![format!("control.rs:0 {at}")],
                 vec![
-                    ("rid", Py::str(log.rid.as_str())),
+                    ("rid", Py::str(rid.as_str())),
                     ("method", Py::str(method.as_str())),
                     ("path", Py::str(path.as_str())),
                     ("crid", Py::str(crid.as_str())),
@@ -188,12 +192,12 @@ pub async fn route(state: &Arc<State>, req: Request<Incoming>) -> Routed {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &Py::dict()
                     .with("error", "internal error")
-                    .with("rid", log.rid.as_str()),
+                    .with("rid", rid.as_str()),
                 &headers,
             )
         }
     };
-    Ok(log.finish(resp))
+    Ok(resp)
 }
 
 async fn dispatch(

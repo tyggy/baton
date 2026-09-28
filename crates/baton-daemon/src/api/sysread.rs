@@ -9,7 +9,7 @@
 use super::Routed;
 use crate::cmd;
 use crate::http::bytes_response;
-use crate::logs::{self, RequestLog};
+use crate::logs;
 use crate::proxy::Body;
 use crate::pyjson::{Py, Style};
 use crate::state::State;
@@ -26,11 +26,7 @@ pub async fn route(state: &Arc<State>, req: Request<Incoming>) -> Routed {
     }
     match req.uri().path() {
         "/api/browse" => browse(state, req).await,
-        "/api/orphans" => {
-            let log = RequestLog::begin(&req);
-            let resp = orphans(state, req.headers()).await;
-            Ok(log.finish(resp))
-        }
+        "/api/orphans" => Ok(orphans(state, req.headers()).await),
         _ => Err(req),
     }
 }
@@ -135,13 +131,11 @@ async fn browse(state: &Arc<State>, mut req: Request<Incoming>) -> Routed {
             Err(_) => None, // permission errors: control answers [] like Python
         };
         if let Some((status, msg)) = err {
-            let log = RequestLog::begin(&req);
-            let resp = send_json(
+            return Ok(send_json(
                 status,
                 &Py::dict().with("error", msg).with("dir", dir.as_str()),
                 req.headers(),
-            );
-            return Ok(log.finish(resp));
+            ));
         }
     }
     if let Some(exp) = expanded {

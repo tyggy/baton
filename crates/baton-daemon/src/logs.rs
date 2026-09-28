@@ -186,6 +186,10 @@ pub struct RequestLog {
     started: Instant,
 }
 
+/// The current request's id, in the request extensions (set by `handle`).
+#[derive(Clone)]
+pub struct Rid(pub String);
+
 impl RequestLog {
     pub fn begin<B>(req: &Request<B>) -> RequestLog {
         let pq = req
