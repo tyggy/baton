@@ -1,0 +1,34 @@
+{
+  "comment": "Shared by crates/baton-daemon/src/push.rs and apple/PushCrypto. Hex unless named *_b64.",
+  "rfc9180_a2_1": {
+    "source": "RFC 9180 Appendix A.2.1 (DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, mode_base), first encryption",
+    "info": "4f6465206f6e2061204772656369616e2055726e",
+    "ikmE": "909a9b35d3dc4713a5e72a4da274b55d3d3821a37e5d099e74a647db583a904b",
+    "ikmR": "1ac01f181fdf9f352797655161c58b75c656a6cc2716dcb66372da835542e1df",
+    "skRm": "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb",
+    "pkRm": "4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a",
+    "enc": "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a",
+    "aad": "436f756e742d30",
+    "pt": "4265617574792069732074727574682c20747275746820626561757479",
+    "ct": "1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db21993c62ce81883d2dd1b51a28"
+  },
+  "baton_v1": {
+    "info": "baton push v1",
+    "aad": "",
+    "ikmR": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "ikmE": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "skR": "91f7a467df4ef97053ec2a47b6e619f632df9547bb009fd0bcc747909f1b7bd4",
+    "public_key_b64": "sfG4QN56MkGwJ0jPmwW3TcjF6EUSmHOIF712qo6+jCs=",
+    "notification": {
+      "v": 1,
+      "kind": "needs_permission",
+      "title": "baton needs permission",
+      "body": "Claude needs your permission to use Bash — café ☕",
+      "session": "4f1c2a9e-0b7d-4c55-9a2e-1d2f3e4a5b6c",
+      "ts": 1790000000
+    },
+    "plaintext_hex": "7b2276223a312c226b696e64223a226e656564735f7065726d697373696f6e222c227469746c65223a226261746f6e206e65656473207065726d697373696f6e222c22626f6479223a22436c61756465206e6565647320796f7572207065726d697373696f6e20746f20757365204261736820e2809420636166c3a920e29895222c2273657373696f6e223a2234663163326139652d306237642d346335352d396132652d316432663365346135623663222c227473223a313739303030303030307d20202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020",
+    "sealed_b64": "aTZYJUYw9zrY2nj7Mxv5ds1C+Q4OnJ6D9AxRBypvdBfrTgbmC0Y4EdDqbnFOF4K8GGO7iRR/6VWLCUkXdvEabqNqLP2MJ7hl0O5+TxTEJlaoEBQmy5n6TcN3/pyCZbr30/sGqxUpFvnTSZmznMOKDVCwmr6BvamYlmrksppMc4xV2834+yEGzC5fCsZfzHCzZ6mdBg3wGByvx/+7+11eW/mQnE2yPTTRcGnfwuNUwNm96+iI9aR5o0SJes/EM26RAR4NYpvmkbmUrIFHa3UCAvsRoU1ua8aZKRxQgq4pbPzhqNFNqOgOK0BvAWI8f4mt5ypaPbaICJ62UtbUT1jP2T4SGxoqOuJSdXYQppTLX/M9ms+jjK1ctjd8R2oGGkcc9qScF6wobtZkT2az9IQzmg==",
+    "note": "sealed_b64 = base64(enc || ciphertext), exactly what goes in the APNs payload under baton.ct. ikmE is the ephemeral key seed (RFC 9180 DeriveKeyPair); CryptoKit has no API to fix it, so Swift checks decryption of this vector and its own random-ephemeral roundtrip."
+  }
+}

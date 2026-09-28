@@ -1,0 +1,16 @@
+// Baton push relay. No account id here on purpose: wrangler asks which
+// account to use on first deploy (or set CLOUDFLARE_ACCOUNT_ID).
+// Secrets (never committed; see README): APNS_KEY, APNS_KEY_ID,
+// APNS_TEAM_ID, APNS_TOPIC, REGISTRATION_SECRET.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "baton-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [{ "name": "RATE_LIMITER", "class_name": "RateLimiter" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RateLimiter"] }]
+}
