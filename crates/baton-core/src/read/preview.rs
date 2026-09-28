@@ -490,7 +490,8 @@ fn py_splitlines(s: &str) -> Vec<&str> {
     out
 }
 
-/// Python `int(str)` (whitespace allowed, underscores between digits).
+/// Python `int(str)` (whitespace allowed, underscores between digits);
+/// values beyond i64 saturate (Python ints don't overflow).
 pub fn py_int_str(s: &str) -> Option<i64> {
     let t = strip(s);
     let (neg, t) = match t.as_bytes().first() {
@@ -501,10 +502,10 @@ pub fn py_int_str(s: &str) -> Option<i64> {
     if t.is_empty() || t.starts_with('_') || t.ends_with('_') || t.contains("__") {
         return None;
     }
-    let digits: String = t.chars().filter(|&c| c != '_').collect();
     let mut v: i64 = 0;
-    for c in digits.chars() {
-        v = v.checked_mul(10)?.checked_add(c.to_digit(10)? as i64)?;
+    for c in t.chars().filter(|&c| c != '_') {
+        let d = c.to_digit(10)? as i64;
+        v = v.saturating_mul(10).saturating_add(d);
     }
     Some(if neg { -v } else { v })
 }
