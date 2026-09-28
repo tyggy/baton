@@ -1,0 +1,88 @@
+# Baton for Mac — menu-bar app that hosts the `baton` daemon (SMAppService
+# LaunchAgent) and walks the user through permissions, Tailscale and pairing.
+#
+#   ./build.sh            # cargo build --release + xcodegen + xcodebuild
+#
+# Open-source builders: override the identity on the command line, e.g.
+#   xcodebuild ... BATON_BUNDLE_ID=org.example.baton.mac DEVELOPMENT_TEAM=ABCDE12345
+name: BatonMac
+options:
+  bundleIdPrefix: com.torwood
+  developmentLanguage: en
+  deploymentTarget:
+    macOS: '15.0'
+
+settings:
+  base:
+    # --- identity (override these) ---
+    BATON_BUNDLE_ID: com.torwood.baton.mac
+    BATON_DAEMON_LABEL: com.torwood.baton.daemon
+    DEVELOPMENT_TEAM: 42XHV4JW8B
+    # --- daemon binary copied into Contents/Helpers/baton ---
+    # Default: the workspace's cargo target dir. build.sh points this at
+    # $CARGO_TARGET_DIR/release/baton.
+    BATON_DAEMON_BIN: $(SRCROOT)/../../target/release/baton
+    PRODUCT_BUNDLE_IDENTIFIER: $(BATON_BUNDLE_ID)
+    PRODUCT_NAME: Baton
+    MARKETING_VERSION: 0.1.0
+    CURRENT_PROJECT_VERSION: 1
+    SWIFT_VERSION: 5.0
+    MACOSX_DEPLOYMENT_TARGET: '15.0'
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: Apple Development
+    ENABLE_HARDENED_RUNTIME: YES
+    ENABLE_APP_SANDBOX: NO
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+    ALWAYS_SEARCH_USER_PATHS: NO
+    GENERATE_INFOPLIST_FILE: NO
+
+targets:
+  BatonMac:
+    type: application
+    platform: macOS
+    sources:
+      - path: BatonMac
+        excludes:
+          - "*.entitlements"
+    settings:
+      CODE_SIGN_ENTITLEMENTS: BatonMac/BatonMac.entitlements
+    info:
+      path: BatonMac/Info.plist
+      properties:
+        CFBundleDevelopmentRegion: $(DEVELOPMENT_LANGUAGE)
+        CFBundleDisplayName: Baton
+        CFBundleExecutable: $(EXECUTABLE_NAME)
+        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
+        CFBundleInfoDictionaryVersion: '6.0'
+        CFBundleName: $(PRODUCT_NAME)
+        CFBundlePackageType: $(PRODUCT_BUNDLE_PACKAGE_TYPE)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.developer-tools
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        LSUIElement: true
+        BatonDaemonLabel: $(BATON_DAEMON_LABEL)
+        NSAppleEventsUsageDescription: >-
+          Baton focuses and drives the Terminal tabs that run your Claude Code
+          and Codex sessions when you open or resume them from your iPhone.
+    postCompileScripts:
+      - name: Embed baton daemon + LaunchAgent
+        script: '"${SRCROOT}/scripts/embed-daemon.sh"'
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - $(BATON_DAEMON_BIN)
+          - $(SRCROOT)/LaunchAgents/daemon.plist
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/baton
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/$(BATON_DAEMON_LABEL).plist
+
+schemes:
+  BatonMac:
+    build:
+      targets:
+        BatonMac: all
+    run:
+      config: Debug
+    archive:
+      config: Release

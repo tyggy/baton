@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: embed-daemon.sh substitutes __LABEL__ and __BUNDLE_ID__ and
+     installs it as Contents/Library/LaunchAgents/<label>.plist.
+     Arguments are fixed; the app writes listen/upstream to the config file
+     (default: 127.0.0.1:19880, upstream http://127.0.0.1:19877). -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>__LABEL__</string>
+	<key>BundleProgram</key>
+	<string>Contents/Helpers/baton</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>baton</string>
+		<string>serve</string>
+		<string>--config</string>
+		<string>~/Library/Application Support/Baton/daemon.conf</string>
+	</array>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>__BUNDLE_ID__</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>BATON_LOG_DIR</key>
+		<string>~/Library/Logs/Baton</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/baton-daemon.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/baton-daemon.err.log</string>
+</dict>
+</plist>

@@ -17,13 +17,43 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-const USAGE: &str = "usage: baton serve [--listen 127.0.0.1:19880] [--upstream http://127.0.0.1:19877]\n       baton sessions   (session list as JSON)";
+const USAGE: &str = "usage: baton serve [--listen 127.0.0.1:19880] [--upstream http://127.0.0.1:19877] [--config FILE]\n       baton sessions   (session list as JSON)";
 
-fn arg(args: &[String], name: &str, default: &str) -> String {
+fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+/// `~/…` → `$HOME/…`. launchd doesn't expand `~`, and the Mac app's
+/// LaunchAgent plist can't know the user's home at build time.
+pub fn expand_home(p: &str) -> std::path::PathBuf {
+    match p.strip_prefix("~/") {
+        Some(rest) => {
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest)
+        }
+        None => std::path::PathBuf::from(p),
+    }
+}
+
+/// `--config FILE`: `key=value` lines (`listen`, `upstream`), written by the
+/// Mac app so its bundled LaunchAgent can keep fixed arguments. A missing
+/// file means defaults. Explicit flags win over the file.
+fn config_value(args: &[String], key: &str) -> Option<String> {
+    let path = flag(args, "--config")?;
+    let text = std::fs::read_to_string(expand_home(&path)).ok()?;
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter_map(|l| l.split_once('='))
+        .filter(|(k, _)| k.trim() == key)
+        .map(|(_, v)| v.trim().to_string())
+        .rfind(|v| !v.is_empty())
+}
+
+fn arg(args: &[String], name: &str, default: &str) -> String {
+    flag(args, name)
+        .or_else(|| config_value(args, name.trim_start_matches("--")))
         .unwrap_or_else(|| default.to_string())
 }
 
