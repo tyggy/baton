@@ -10,7 +10,7 @@ options:
   bundleIdPrefix: com.torwood
   developmentLanguage: en
   deploymentTarget:
-    macOS: '15.0'
+    macOS: '26.0'
 
 settings:
   base:
@@ -27,7 +27,7 @@ settings:
     MARKETING_VERSION: 0.1.0
     CURRENT_PROJECT_VERSION: 1
     SWIFT_VERSION: 5.0
-    MACOSX_DEPLOYMENT_TARGET: '15.0'
+    MACOSX_DEPLOYMENT_TARGET: '26.0'
     CODE_SIGN_STYLE: Automatic
     CODE_SIGN_IDENTITY: Apple Development
     ENABLE_HARDENED_RUNTIME: YES
@@ -64,8 +64,8 @@ targets:
         LSUIElement: true
         BatonDaemonLabel: $(BATON_DAEMON_LABEL)
         NSAppleEventsUsageDescription: >-
-          Baton focuses and drives the Terminal tabs that run your Claude Code
-          and Codex sessions when you open or resume them from your iPhone.
+          Baton brings your Claude Code and Codex sessions to the front in
+          Terminal when you open them from your iPhone.
     postCompileScripts:
       - name: Embed baton daemon + LaunchAgent
         script: '"${SRCROOT}/scripts/embed-daemon.sh"'

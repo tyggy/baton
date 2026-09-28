@@ -73,6 +73,21 @@ final class TailscaleModel: ObservableObject {
     @Published var info: TailscaleInfo?
     @Published var loading = false
 
+    /// Runs `tailscale serve --bg --https=443 http://127.0.0.1:<port>` —
+    /// only ever from an explicit user click. Returns error details or nil.
+    func enableServe(port: String) async -> String? {
+        guard let cli = info?.cliPath else { return "tailscale CLI not found" }
+        let args = Self.serveArgs(port: port)
+        let r = await Task.detached { Shell.run(cli, args, timeout: 30) }.value
+        refresh()
+        if r.status == 0 { return nil }
+        return "\(cli) \(args.joined(separator: " "))\nexit \(r.status)\(r.timedOut ? " (timed out)" : "")\n\(r.stderr)\(r.stdout)"
+    }
+
+    nonisolated static func serveArgs(port: String) -> [String] {
+        ["serve", "--bg", "--https=443", "http://127.0.0.1:\(port)"]
+    }
+
     func refresh() {
         guard !loading else { return }
         loading = true

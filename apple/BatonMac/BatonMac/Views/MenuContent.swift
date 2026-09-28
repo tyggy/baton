@@ -5,20 +5,18 @@ struct MenuContent: View {
     @EnvironmentObject var daemon: DaemonController
     @EnvironmentObject var permissions: Permissions
     @EnvironmentObject var tailscale: TailscaleModel
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         Text(daemon.statusLine)
-        if daemon.registration != .enabled {
-            Text("LaunchAgent: \(daemon.registration.label)")
-        }
-        Text(permissions.missingCount == 0
-             ? "Permissions: all set"
-             : "Permissions: \(permissions.missingCount) need attention")
+        Text(permissions.requiredMissing ? "Terminal access: needed" : "Terminal access: allowed")
         Text(tailscale.summary)
         Divider()
-        Button("Open Onboarding…") { WindowManager.shared.showOnboarding() }
+        Button("Pair iPhone…") { NSApp.activate(); openWindow(id: "pairing") }
+        Button("Show Setup Again…") { NSApp.activate(); openWindow(id: "onboarding") }
+        Button("Settings…") { NSApp.activate(); openSettings() }
             .keyboardShortcut(",")
-        Button("Pair iPhone…") { WindowManager.shared.showPairing() }
         Button("Open Logs") {
             let dir = DaemonController.logsURL
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -26,9 +24,9 @@ struct MenuContent: View {
         }
         Divider()
         if daemon.registration == .enabled {
-            Button("Restart Daemon") { daemon.restart() }
+            Button("Restart Baton Service") { daemon.restart() }
         } else {
-            Button("Start Daemon") { daemon.register() }
+            Button("Start Baton Service") { Task { _ = await daemon.ensureRunning() } }
         }
         Divider()
         Button("Quit Baton") { NSApp.terminate(nil) }

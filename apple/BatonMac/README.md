@@ -21,6 +21,33 @@ CARGO_TARGET_DIR=/path/to/cargo-target DERIVED_DATA=/path/to/derived ./build.sh
 signs it with the app's identity (hardened runtime) and installs
 `Contents/Library/LaunchAgents/<label>.plist` from `LaunchAgents/daemon.plist`.
 
+## First run
+
+A four-step setup window (after Apple's own setup sheets; Liquid Glass
+buttons, macOS 26+), whose only goal is "your iPhone is connected". Each step
+advances by itself once its check passes:
+
+1. **Welcome** — Continue registers the background item and waits for it to answer.
+2. **Terminal** — pre-alert with a single Continue that triggers the system
+   Automation prompt; a denial gets its own screen (Open System Settings /
+   Continue Without It).
+3. **Scan with your iPhone** — QR pairing code; "Waiting for your iPhone…"
+   completes when the phone registers (`~/.config/baton/devices.json`) or a
+   non-local client shows up in the request logs.
+4. **Reach your Mac away from home** — shows only the next Tailscale action
+   (install, sign in, HTTPS certificates, then "Turn On Remote Access", which
+   runs `tailscale serve --bg --https=443 http://127.0.0.1:<port>` on click
+   only). "Set Up Later" skips it.
+
+Then a brief "You're all set" pointing at the menu bar; `onboardingComplete`
+stops the window from opening again. Menu → Show Setup Again… reopens it.
+Notifications, Accessibility and Documents are not asked during setup; they
+live in Settings → Status. Settings → Advanced has the listen/upstream
+addresses, logs and "Show Setup Again…".
+
+Screenshots: `docs/onboarding-step-{1..5}-{light,dark}.png`,
+`docs/settings-status-light.png`.
+
 ## Layout
 
 | Path | What |
@@ -29,7 +56,9 @@ signs it with the app's identity (hardened runtime) and installs
 | `BatonMac/Services/Permissions.swift` | Automation → Terminal, Documents (background probe, 3 s deadline), Accessibility, Notifications |
 | `BatonMac/Services/Tailscale.swift` | read-only `tailscale status --json` / `serve status --json` |
 | `BatonMac/Services/Pairing.swift` | pairing payload + QR |
-| `BatonMac/Views/` | menu, onboarding window, pairing window |
+| `BatonMac/Views/Onboarding/` | setup flow (`SetupFlow`, `Pages`, `SetupScaffold`) |
+| `BatonMac/Views/Settings/` | Settings scene: Status and Advanced tabs |
+| `BatonMac/Services/PairingWatcher.swift` | detects the first iPhone connection |
 
 ## Daemon config
 
@@ -43,5 +72,15 @@ upstream `http://127.0.0.1:19877`. Daemon logs go to `~/Library/Logs/Baton`
 ## Launch arguments (scripted checks)
 
 - `--daemon register|unregister`
-- `--show onboarding|pairing`, plus `--snapshot <png>` to render that window
-  to a file after 6 s (no Screen Recording permission needed)
+- `--show onboarding|pairing|settings`, `--step N` (pin the setup flow to a
+  step: no side effects, no auto-advance), `--appearance light|dark`
+- `--snapshot <png>` renders the shown window after 6 s with ScreenCaptureKit's
+  current-process content (no Screen Recording permission), then quits. The
+  pairing token is replaced with a placeholder in this mode.
+
+```sh
+B=.../Baton.app/Contents/MacOS/Baton
+for n in 1 2 3 4 5; do for ap in light dark; do
+  $B --show onboarding --step $n --appearance $ap --snapshot docs/onboarding-step-$n-$ap.png
+done; done
+```

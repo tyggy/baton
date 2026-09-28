@@ -3,14 +3,16 @@ import ApplicationServices
 import CoreServices
 import UserNotifications
 
+/// `.pending` is neutral (optional or not asked yet); `.attention` is
+/// reserved for required things.
 enum Level: Equatable {
-    case ok, attention, bad, checking
+    case ok, pending, attention, bad, checking
 }
 
 struct CheckStatus: Equatable {
     var level: Level
     var detail: String
-    static let checking = CheckStatus(level: .checking, detail: "checking…")
+    static let checking = CheckStatus(level: .checking, detail: "Checking…")
 }
 
 enum SettingsLink {
@@ -39,9 +41,8 @@ final class Permissions: ObservableObject {
     /// first run it shows the system prompt.
     private var documentsProbeInFlight = false
 
-    var missingCount: Int {
-        [automation, documents, accessibility, notifications].filter { $0.level == .bad || $0.level == .attention }.count
-    }
+    /// Only Terminal access is required; the rest are optional extras.
+    var requiredMissing: Bool { automation.level != .ok }
 
     func refreshAll(includeDocuments: Bool) {
         refreshAutomation(ask: false)
@@ -55,7 +56,7 @@ final class Permissions: ObservableObject {
     nonisolated static let terminalBundleID = "com.apple.Terminal"
 
     func refreshAutomation(ask: Bool) {
-        if ask { automation = CheckStatus(level: .checking, detail: "waiting for your answer…") }
+        if ask { automation = CheckStatus(level: .checking, detail: "Waiting for your answer…") }
         Task.detached {
             let status = Self.automationStatus(ask: ask)
             await MainActor.run { self.automation = status }
@@ -79,15 +80,15 @@ final class Permissions: ObservableObject {
         let err = AEDeterminePermissionToAutomateTarget(desc, typeWildCard, typeWildCard, ask)
         switch err {
         case noErr:
-            return CheckStatus(level: .ok, detail: "allowed")
+            return CheckStatus(level: .ok, detail: "Allowed")
         case OSStatus(errAEEventNotPermitted):
-            return CheckStatus(level: .bad, detail: "denied — enable Baton → Terminal in Settings")
+            return CheckStatus(level: .bad, detail: "Turned off in System Settings")
         case OSStatus(errAEEventWouldRequireUserConsent):
-            return CheckStatus(level: .attention, detail: "not asked yet — press Request")
+            return CheckStatus(level: .attention, detail: "Not asked yet")
         case OSStatus(procNotFound):
-            return CheckStatus(level: .attention, detail: "Terminal isn't running, can't check — press Request")
+            return CheckStatus(level: .attention, detail: "Unknown until Terminal is open")
         default:
-            return CheckStatus(level: .attention, detail: "unknown (OSStatus \(err))")
+            return CheckStatus(level: .attention, detail: "Unknown (OSStatus \(err))")
         }
     }
 
@@ -96,7 +97,7 @@ final class Permissions: ObservableObject {
     func refreshDocuments() {
         guard !documentsProbeInFlight else { return }
         documentsProbeInFlight = true
-        documents = CheckStatus(level: .checking, detail: "listing ~/Documents…")
+        documents = CheckStatus(level: .checking, detail: "Checking…")
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents").path
         // The listing runs on its own thread: if TCC blocks it behind a
         // prompt, the thread waits, the UI doesn't.
@@ -105,15 +106,15 @@ final class Permissions: ObservableObject {
             let result: CheckStatus
             do {
                 let n = try FileManager.default.contentsOfDirectory(atPath: dir).count
-                result = CheckStatus(level: .ok, detail: "allowed (\(n) items)")
+                result = CheckStatus(level: .ok, detail: "Allowed (\(n) items)")
             } catch let e as NSError {
                 let posix = (e.userInfo[NSUnderlyingErrorKey] as? NSError)?.code
                 if posix == Int(EPERM) || e.code == NSFileReadNoPermissionError {
-                    result = CheckStatus(level: .bad, detail: "denied — enable Baton → Documents Folder in Settings")
+                    result = CheckStatus(level: .pending, detail: "Off")
                 } else if e.code == NSFileReadNoSuchFileError {
-                    result = CheckStatus(level: .ok, detail: "no ~/Documents folder")
+                    result = CheckStatus(level: .ok, detail: "No Documents folder")
                 } else {
-                    result = CheckStatus(level: .attention, detail: e.localizedDescription)
+                    result = CheckStatus(level: .pending, detail: e.localizedDescription)
                 }
             }
             box.finish(result)
@@ -125,7 +126,7 @@ final class Permissions: ObservableObject {
         Task {
             try? await Task.sleep(for: .seconds(3))
             if !box.done {
-                self.documents = CheckStatus(level: .attention, detail: "needs approval — answer the system prompt, or allow in Settings")
+                self.documents = CheckStatus(level: .pending, detail: "Waiting for approval")
             }
         }
     }
@@ -134,8 +135,8 @@ final class Permissions: ObservableObject {
 
     func refreshAccessibility() {
         accessibility = AXIsProcessTrusted()
-            ? CheckStatus(level: .ok, detail: "allowed")
-            : CheckStatus(level: .attention, detail: "not allowed (optional for now)")
+            ? CheckStatus(level: .ok, detail: "Allowed")
+            : CheckStatus(level: .pending, detail: "Off")
     }
 
     func requestAccessibility() {
@@ -149,10 +150,10 @@ final class Permissions: ObservableObject {
     func refreshNotifications() async {
         let s = await UNUserNotificationCenter.current().notificationSettings()
         notifications = switch s.authorizationStatus {
-        case .authorized, .provisional: CheckStatus(level: .ok, detail: "allowed")
-        case .denied: CheckStatus(level: .bad, detail: "denied — enable in Settings → Notifications")
-        case .notDetermined: CheckStatus(level: .attention, detail: "not asked yet — press Request")
-        default: CheckStatus(level: .attention, detail: "status \(s.authorizationStatus.rawValue)")
+        case .authorized, .provisional: CheckStatus(level: .ok, detail: "On")
+        case .denied: CheckStatus(level: .pending, detail: "Off in System Settings")
+        case .notDetermined: CheckStatus(level: .pending, detail: "Off")
+        default: CheckStatus(level: .pending, detail: "Status \(s.authorizationStatus.rawValue)")
         }
     }
 

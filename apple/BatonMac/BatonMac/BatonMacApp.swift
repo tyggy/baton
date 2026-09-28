@@ -1,4 +1,5 @@
 import AppKit
+import ScreenCaptureKit
 import SwiftUI
 
 @main
@@ -8,45 +9,80 @@ struct BatonMacApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MenuContent()
-                .environmentObject(model)
-                .environmentObject(model.daemon)
-                .environmentObject(model.permissions)
-                .environmentObject(model.tailscale)
+            MenuContent().environments(model)
         } label: {
             Image(systemName: model.menuSymbol)
         }
         .menuBarExtraStyle(.menu)
+
+        Window("Welcome to Baton", id: "onboarding") {
+            SetupFlow()
+                .environments(model)
+                .containerBackground(.thickMaterial, for: .window)
+        }
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentSize)
+        .windowBackgroundDragBehavior(.enabled)
+        .restorationBehavior(.disabled)
+        .defaultPosition(.center)
+        .defaultLaunchBehavior(LaunchOptions.openOnboardingAtLaunch ? .presented : .suppressed)
+
+        Window("Pair iPhone", id: "pairing") {
+            PairingView()
+                .environments(model)
+                .containerBackground(.thickMaterial, for: .window)
+        }
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentSize)
+        .windowBackgroundDragBehavior(.enabled)
+        .restorationBehavior(.disabled)
+        .defaultPosition(.center)
+        .defaultLaunchBehavior(LaunchOptions.show == "pairing" ? .presented : .suppressed)
+
+        Settings {
+            SettingsView().environments(model)
+        }
+    }
+}
+
+extension View {
+    func environments(_ m: AppModel) -> some View {
+        environmentObject(m)
+            .environmentObject(m.daemon)
+            .environmentObject(m.permissions)
+            .environmentObject(m.tailscale)
     }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_: Notification) {
+        switch LaunchOptions.appearance {
+        case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
+        case "light": NSApp.appearance = NSAppearance(named: .aqua)
+        default: break
+        }
+    }
+
     func applicationDidFinishLaunching(_: Notification) {
         MainActor.assumeIsolated {
             let m = AppModel.shared
             m.start()
-            // `--show onboarding|pairing` opens a window at launch (used by
-            // scripted checks and screenshots).
-            let args = ProcessInfo.processInfo.arguments
-            // `--daemon register|unregister`: scripted registration (checks, CI smoke).
-            if let i = args.firstIndex(of: "--daemon"), i + 1 < args.count {
-                args[i + 1] == "unregister" ? m.daemon.unregister() : m.daemon.register()
+            switch LaunchOptions.daemonAction {
+            case "register": m.daemon.register()
+            case "unregister": m.daemon.unregister()
+            default: break
             }
-            if let i = args.firstIndex(of: "--show"), i + 1 < args.count {
-                args[i + 1] == "pairing" ? WindowManager.shared.showPairing() : WindowManager.shared.showOnboarding()
-                // `--snapshot <png>`: render the window's own content (no
-                // Screen Recording permission needed) once checks settle.
-                if let j = args.firstIndex(of: "--snapshot"), j + 1 < args.count {
-                    let id = args[i + 1] == "pairing" ? "pairing" : "onboarding"
-                    let path = args[j + 1]
-                    Task { @MainActor in
-                        try? await Task.sleep(for: .seconds(6))
-                        WindowManager.shared.snapshot(id: id, to: URL(fileURLWithPath: path))
-                    }
+            if LaunchOptions.show == "settings" { Snapshots.showSettingsPreview() }
+            if LaunchOptions.openOnboardingAtLaunch || LaunchOptions.show != nil { NSApp.activate() }
+            if let path = LaunchOptions.snapshot {
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(4))
+                    // Legacy forced activation (snapshot mode only).
+                    NSApp.perform(NSSelectorFromString("activateIgnoringOtherApps:"), with: true)
+                    try? await Task.sleep(for: .seconds(2))
+                    await Snapshots.write(windowID: LaunchOptions.show ?? "onboarding", to: URL(fileURLWithPath: path))
+                    NSApp.terminate(nil)
                 }
-            } else if !UserDefaults.standard.bool(forKey: "onboarding.shown") {
-                UserDefaults.standard.set(true, forKey: "onboarding.shown")
-                WindowManager.shared.showOnboarding()
             }
         }
     }
@@ -78,57 +114,57 @@ final class AppModel: ObservableObject {
     }
 }
 
-/// Plain AppKit windows (an LSUIElement app has no window scenes to open at
-/// launch); each hosts a SwiftUI view and brings the app forward.
+/// `--snapshot`: render a window's content to PNG from inside the app (no
+/// Screen Recording permission). Materials don't draw through
+/// cacheDisplay, so the window background colour is painted underneath.
 @MainActor
-final class WindowManager {
-    static let shared = WindowManager()
-    private var windows: [String: NSWindow] = [:]
+enum Snapshots {
+    private static var preview: NSWindow?
 
-    func showOnboarding() {
-        show(id: "onboarding", title: "Baton Setup", size: NSSize(width: 640, height: 720)) {
-            OnboardingView()
-        }
-        AppModel.shared.permissions.refreshAll(includeDocuments: true)
-        AppModel.shared.tailscale.refresh()
-    }
-
-    func showPairing() {
-        show(id: "pairing", title: "Pair iPhone", size: NSSize(width: 440, height: 600)) {
-            PairingView()
-        }
-        AppModel.shared.tailscale.refresh()
-    }
-
-    func snapshot(id: String, to url: URL) {
-        guard let v = windows[id]?.contentView,
-              let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
-        v.cacheDisplay(in: v.bounds, to: rep)
-        try? rep.representation(using: .png, properties: [:])?.write(to: url)
-    }
-
-    private func show<V: View>(id: String, title: String, size: NSSize, @ViewBuilder content: () -> V) {
+    /// Settings content in a plain window (the Settings scene can't be opened
+    /// programmatically at launch).
+    static func showSettingsPreview() {
         let m = AppModel.shared
-        if let w = windows[id] {
-            w.makeKeyAndOrderFront(nil)
-            NSApp.activate()
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 620),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.identifier = NSUserInterfaceItemIdentifier("settings")
+        w.title = "Settings"
+        w.contentView = NSHostingView(rootView: SettingsView().environments(m))
+        w.center()
+        w.makeKeyAndOrderFront(nil)
+        preview = w
+    }
+
+    /// Captures the real window (glass and materials included) through
+    /// ScreenCaptureKit's current-process content, which needs no Screen
+    /// Recording permission. Falls back to cacheDisplay.
+    static func write(windowID: String, to url: URL) async {
+        guard let w = NSApp.windows.first(where: { $0.identifier?.rawValue.hasPrefix(windowID) == true && $0.isVisible }) else {
+            FileHandle.standardError.write(Data("snapshot: no window \(windowID)\n".utf8))
             return
         }
-        let root = content()
-            .environmentObject(m)
-            .environmentObject(m.daemon)
-            .environmentObject(m.permissions)
-            .environmentObject(m.tailscale)
-        let w = NSWindow(
-            contentRect: NSRect(origin: .zero, size: size),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered, defer: false)
-        w.title = title
-        w.isReleasedWhenClosed = false
-        w.contentView = NSHostingView(rootView: root)
-        w.center()
-        windows[id] = w
         w.makeKeyAndOrderFront(nil)
-        NSApp.activate()
+        do {
+            let content = try await SCShareableContent.currentProcess
+            guard let scw = content.windows.first(where: { $0.windowID == CGWindowID(w.windowNumber) }) else {
+                throw NSError(domain: "snapshot", code: 1)
+            }
+            let filter = SCContentFilter(desktopIndependentWindow: scw)
+            let cfg = SCStreamConfiguration()
+            let scale = w.backingScaleFactor
+            cfg.width = Int(filter.contentRect.width * scale)
+            cfg.height = Int(filter.contentRect.height * scale)
+            cfg.showsCursor = false
+            cfg.ignoreShadowsSingleWindow = true
+            let cg = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
+            let rep = NSBitmapImageRep(cgImage: cg)
+            try rep.representation(using: .png, properties: [:])?.write(to: url)
+            return
+        } catch {
+            FileHandle.standardError.write(Data("snapshot: SCK failed (\(error)); using cacheDisplay\n".utf8))
+        }
+        guard let v = w.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
+        v.cacheDisplay(in: v.bounds, to: rep)
+        try? rep.representation(using: .png, properties: [:])?.write(to: url)
     }
 }

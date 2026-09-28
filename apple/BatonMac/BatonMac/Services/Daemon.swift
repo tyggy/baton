@@ -142,6 +142,47 @@ final class DaemonController: ObservableObject {
         }
     }
 
+    enum StartOutcome: Equatable {
+        case running, needsApproval, failed(String)
+    }
+
+    /// Register (if needed) and wait until `/api/health` answers.
+    func ensureRunning() async -> StartOutcome {
+        writeConfig()
+        refreshRegistration()
+        if registration != .enabled {
+            do {
+                try service.register()
+            } catch {
+                refreshRegistration()
+                if registration == .requiresApproval { return .needsApproval }
+                return .failed("SMAppService.agent(\(label).plist).register(): \(error.localizedDescription)\nstatus: \(registration.label)")
+            }
+            refreshRegistration()
+        }
+        if registration == .requiresApproval { return .needsApproval }
+        for _ in 0..<20 {
+            await pollHealth()
+            if case .running = liveness { return .running }
+            try? await Task.sleep(for: .milliseconds(750))
+        }
+        return .failed("""
+            \(statusLine)
+            LaunchAgent \(label): \(registration.label)
+            listen \(listen), upstream \(upstream)
+            stderr: /tmp/baton-daemon.err.log
+            """)
+    }
+
+    var technicalSummary: String {
+        """
+        \(statusLine)
+        LaunchAgent \(label): \(registration.label)
+        listen \(listen) · upstream \(upstream)
+        config \(Self.configURL.path)
+        """
+    }
+
     func openLoginItems() {
         SMAppService.openSystemSettingsLoginItems()
     }
