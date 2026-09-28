@@ -8,6 +8,9 @@ pub mod grouping;
 pub mod listbuild;
 pub mod pyfmt;
 pub mod pyjson;
+/// The read group's Python-json encoder (unicode/compact/repr variants);
+/// to be unified with `pyjson` after the migration.
+pub mod pyjson_read;
 pub mod sessions;
 pub mod tmuxmap;
 
@@ -162,3 +165,5 @@ impl Tracker {
         }
     }
 }
+pub mod pymd;
+pub mod read;

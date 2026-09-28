@@ -11,3 +11,4 @@ serde_json.workspace = true
 regex = "1"
 md-5 = "0.10"
 libc = "0.2"
+fancy-regex = "0.14"
