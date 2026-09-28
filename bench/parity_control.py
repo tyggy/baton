@@ -269,10 +269,18 @@ class Side:
         return env
 
     def tmux(self, *args):
+        # Pinned with -S: with only TMUX_TMPDIR, a missing dir makes tmux fall
+        # back to the user's default server.
+        if not self.tmuxdir.is_dir():
+            raise RuntimeError(f"sandbox tmux dir {self.tmuxdir} missing; refusing tmux {args}")
         env = {k: v for k, v in os.environ.items() if not k.startswith("TMUX")}
         env["TMUX_TMPDIR"] = str(self.tmuxdir)
         env["SHELL"] = "/bin/sh"
-        return subprocess.run(["tmux", *args], env=env, capture_output=True, text=True)
+        return subprocess.run(["tmux", "-S", self.sock, *args], env=env, capture_output=True, text=True)
+
+    @property
+    def sock(self):
+        return str(self.tmuxdir / f"tmux-{os.getuid()}" / "default")
 
     def norm(self, x):
         s = x if isinstance(x, str) else x.decode("utf-8", "replace")
@@ -445,7 +453,9 @@ def part_b(a, tmp):
     rs_devices = tmp / "rs-devices.json"
     for s in (py, rs):  # each sandbox's tmux server, started with the sandbox env
         env = s.env(fakes)
-        subprocess.run(["tmux", "-f", "/dev/null", "new-session", "-d", "-s", "csm-bench-ctl-keep"], env=env, check=True)
+        (s.tmuxdir / f"tmux-{os.getuid()}").mkdir(parents=True, mode=0o700, exist_ok=True)
+        subprocess.run(["tmux", "-S", s.sock, "-f", "/dev/null", "new-session", "-d", "-s", "csm-bench-ctl-keep"],
+                       env=env, check=True)
     server = ("import sys; sys.path.insert(0, sys.argv[1]); import api_server as a; "
               "a.ThreadedHTTPServer(('127.0.0.1', 19886), a.APIHandler).serve_forever()")
     py.proc = subprocess.Popen([PY311, "-c", server, str(Path(a.ref) / "server")], env=py.env(fakes),
