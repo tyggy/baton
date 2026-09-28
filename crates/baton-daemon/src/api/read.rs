@@ -559,6 +559,12 @@ async fn asset(path: Option<String>, req: &HeaderMap) -> Response<Body> {
         }
         let textual = ctype.starts_with("text/") || ctype.starts_with("application/json");
         let gz = textual && (1400..=assets::ASSET_GZIP_MAX).contains(&st.len()) && accepts;
+        if let Some(root) = baton_core::tcc::blocked_root(std::path::Path::new(&safe)) {
+            return Plan::Json(
+                403,
+                json!({"error": format!("macOS hasn't allowed Baton to read {} yet (System Settings → Privacy & Security → Files and Folders)", root.display()), "folder": root.display().to_string()}),
+            );
+        }
         let file = match std::fs::File::open(&safe) {
             Ok(f) => f,
             Err(e) => return Plan::Json(500, json!({"error": format!("read failed: {}", os_error(&e))})),

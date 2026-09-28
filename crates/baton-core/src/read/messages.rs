@@ -10,6 +10,7 @@ use crate::pyfmt::{head, len, strip, truthy};
 use crate::pyjson_read::{dumps, dumps_unicode, py_str};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
+use std::path::Path;
 
 const EXTS: [&str; 25] = [
     "md", "markdown", "txt", "png", "jpg", "jpeg", "gif", "webp", "heic", "pdf", "csv", "json",
@@ -221,7 +222,12 @@ pub fn attachment_for(policy: &AssetPolicy, path: &str) -> Option<Value> {
     let kind = ext_kind(&ext);
     let size = meta.len();
     let mut preview = String::new();
-    if matches!(kind, "markdown" | "text" | "csv" | "json" | "code") && size <= 200_000 {
+    // The preview is optional: skip it rather than block on a privacy
+    // prompt for ~/Downloads & co. (crate::tcc).
+    if matches!(kind, "markdown" | "text" | "csv" | "json" | "code")
+        && size <= 200_000
+        && crate::tcc::open_ok(Path::new(&safe))
+    {
         if let Ok(bytes) = std::fs::read(&safe) {
             let text = String::from_utf8_lossy(&bytes);
             for raw in universal_lines(&text) {

@@ -26,6 +26,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from core import Client, live_token  # noqa: E402
 from ab import REQ_LOG, endpoint_of, first_diff, norm_body  # noqa: E402
 
+# Endpoints where the daemon differs from Python on purpose (docs/incidents.md):
+# /api/pairing is daemon-only, /api/browse answers 4xx/200 where Python 500s.
+INTENDED = ("/api/pairing", "/api/browse")
+
 SKIP = ("/api/events", "/api/tail/", "/api/pane-stream/", "/api/bench", "/api/voice")
 
 
@@ -46,6 +50,25 @@ def recent_paths(n):
         if len(out) >= n:
             break
     return out
+
+
+def coarse(body):
+    """Normalised body with floats rounded to one decimal: time-based scores
+    (importance, momentum) drift between two fetches a few ms apart."""
+    try:
+        j = json.loads(norm_body(body))
+    except Exception:
+        return body
+
+    def r(x):
+        if isinstance(x, float):
+            return round(x, 1)
+        if isinstance(x, dict):
+            return {k: r(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [r(v) for v in x]
+        return x
+    return json.dumps(r(j), sort_keys=True)
 
 
 def client(url, token):
@@ -74,6 +97,10 @@ def main():
         same = lambda r, n: rd.status == r.status and nd == n  # noqa: E731
         if same(r1, n1) or same(r2, n2):
             counts["same"] += 1
+        elif p.startswith(INTENDED):
+            counts["intended"] += 1
+        elif rd.status == r1.status and coarse(rd.body or b"") == coarse(r1.body or b""):
+            counts["same"] += 1
         elif n1 != n2 or r1.status != r2.status:
             counts["live"] += 1
         else:
@@ -88,7 +115,7 @@ def main():
     Path(a.log).parent.mkdir(parents=True, exist_ok=True)
     with open(a.log, "a") as f:
         f.write(json.dumps(rec) + "\n")
-    print(f"same {counts['same']}  live {counts['live']}  diff {counts['diff']}  "
+    print(f"same {counts['same']}  intended {counts['intended']}  live {counts['live']}  diff {counts['diff']}  "
           f"p50 py {rec['py_p50_ms']} ms / daemon {rec['daemon_p50_ms']} ms")
     for d in diffs[:10]:
         print(f"  DIFF {d['endpoint']}: {d['detail']}")

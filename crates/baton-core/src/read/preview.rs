@@ -520,6 +520,9 @@ struct CacheRead {
 
 /// The fast path of `_send_session_markdown`: the pre-extracted `.md`.
 fn read_cached(path: &Path) -> Option<CacheRead> {
+    if !crate::tcc::open_ok(path) {
+        return None; // falls back to parsing the transcript
+    }
     let bytes = std::fs::read(path).ok()?;
     let raw = String::from_utf8(bytes).ok()?;
     let raw = raw.replace("\r\n", "\n").replace('\r', "\n");
