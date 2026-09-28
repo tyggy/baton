@@ -56,6 +56,7 @@ type HResult = Result<Response<Body>, Fail>;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Ep {
     Health,
+    Pairing,
     Temp,
     Browse,
     Orphans,
@@ -86,6 +87,7 @@ fn classify(method: &Method, path: &str) -> Option<Ep> {
     if method == Method::GET {
         return match path {
             "/api/health" => Some(Ep::Health),
+            "/api/pairing" => Some(Ep::Pairing),
             "/api/temp" => Some(Ep::Temp),
             "/api/browse" => Some(Ep::Browse),
             "/api/orphans" => Some(Ep::Orphans),
@@ -185,6 +187,7 @@ async fn dispatch(
 ) -> HResult {
     match ep {
         Ep::Health => Ok(send_json(StatusCode::OK, &health().await, h)),
+        Ep::Pairing => Ok(pairing(state, h)),
         Ep::Temp => Ok(send_json(StatusCode::OK, &thermal().await, h)),
         Ep::Browse => browse(state, q, h).await,
         Ep::Orphans => orphans(state, h).await,
@@ -463,6 +466,23 @@ async fn health() -> Py {
         .with("daemon", env!("CARGO_PKG_VERSION"))
         .with("api_version", API_VERSION)
         .with("min_client", MIN_CLIENT)
+}
+
+/// `GET /api/pairing` (auth): the addresses a paired phone should use, as
+/// last written by the Mac app (`pairing.json`, no token inside). Phones
+/// re-read it after pairing, so pairing before or after remote access is
+/// turned on ends with the same addresses (docs/api.md).
+fn pairing(state: &Arc<State>, h: &HeaderMap) -> Response<Body> {
+    let path = match std::env::var_os("BATON_PAIRING_FILE") {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => state
+            .home
+            .join("Library/Application Support/Baton/pairing.json"),
+    };
+    match std::fs::read(&path).ok().and_then(|b| Py::loads(&b).ok()) {
+        Some(v @ Py::Dict(_)) => send_json(StatusCode::OK, &v, h),
+        _ => err_json(StatusCode::NOT_FOUND, "no pairing info", h),
+    }
 }
 
 /// Process start time (local, `%Y-%m-%dT%H:%M:%S`), from `ps` once.

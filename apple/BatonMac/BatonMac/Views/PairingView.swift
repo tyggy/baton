@@ -7,7 +7,7 @@ struct PairingView: View {
     @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some View {
-        PairPage(pinned: LaunchOptions.isSnapshot, onDone: {}, onNext: { dismissWindow(id: "pairing") })
+        PairPage(pinned: LaunchOptions.isSnapshot, onDone: {}, onNext: { dismissWindow(id: "pairing") }, laterTitle: "Close")
             .padding(.bottom, 28)
             .frame(width: 520, height: 560)
     }

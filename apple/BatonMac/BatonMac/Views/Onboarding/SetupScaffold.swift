@@ -10,7 +10,8 @@ struct SetupPage<Content: View, Links: View>: View {
     var done = false
     let title: String
     let message: String
-    let primaryTitle: String
+    /// nil = no primary button (e.g. while waiting for the phone).
+    let primaryTitle: String?
     var busy = false
     var primaryEnabled = true
     let primary: () -> Void
@@ -26,6 +27,9 @@ struct SetupPage<Content: View, Links: View>: View {
             }
             Text(title)
                 .font(.system(size: 28, weight: .semibold))
+                .foregroundStyle(.primary)
+                // Full-strength label colour: no vibrancy from the window material.
+                .environment(\.backgroundMaterial, nil)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
             Text(message)
@@ -37,17 +41,20 @@ struct SetupPage<Content: View, Links: View>: View {
             content
                 .padding(.top, 20)
             Spacer(minLength: 20)
-            Button(action: primary) {
-                HStack(spacing: 8) {
-                    if busy { ProgressView().controlSize(.small) }
-                    Text(primaryTitle)
+            if let primaryTitle {
+                Button(action: primary) {
+                    HStack(spacing: 8) {
+                        if busy { ProgressView().controlSize(.small) }
+                        Text(primaryTitle)
+                    }
+                    .frame(minWidth: 220)
                 }
-                .frame(minWidth: 220)
+                .buttonStyle(.glassProminent)
+                .controlSize(.extraLarge)
+                .keyboardShortcut(.defaultAction)
+                .disabled(busy || !primaryEnabled)
+                .transition(.scale(scale: 0.9).combined(with: .opacity))
             }
-            .buttonStyle(.glassProminent)
-            .controlSize(.extraLarge)
-            .keyboardShortcut(.defaultAction)
-            .disabled(busy || !primaryEnabled)
             VStack(spacing: 8) { links }
                 .buttonStyle(.link)
                 .font(.callout)
@@ -61,7 +68,7 @@ struct SetupPage<Content: View, Links: View>: View {
 
 extension SetupPage where Content == EmptyView {
     init(symbol: String?, symbolColor: Color = .accentColor, done: Bool = false, title: String, message: String,
-         primaryTitle: String, busy: Bool = false, primaryEnabled: Bool = true, primary: @escaping () -> Void,
+         primaryTitle: String?, busy: Bool = false, primaryEnabled: Bool = true, primary: @escaping () -> Void,
          @ViewBuilder links: () -> Links) {
         self.init(symbol: symbol, symbolColor: symbolColor, done: done, title: title, message: message,
                   primaryTitle: primaryTitle, busy: busy, primaryEnabled: primaryEnabled, primary: primary,

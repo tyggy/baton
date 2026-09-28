@@ -23,6 +23,27 @@ the Rust daemon must keep it byte-compatible slice by slice (see PLAN.md).
 started, python, …}`. `release` is a hash of the running source.
 *To add:* `api_version`, `min_client`.
 
+## Pairing
+
+The Mac app shows a QR code holding
+`{"v":1,"url":"https://<mac>.<tailnet>.ts.net","fallback":"http://<tailscale ip>:19877","lan":"http://<lan ip>:19877","token":"<bearer>"}`
+(`fallback`/`lan` omitted when unknown; without Tailscale, `url` is the LAN
+address). The tailnet name is known before remote access (`tailscale serve`)
+is on, so the QR code is the same whichever order the user sets things up in.
+
+`GET /api/pairing` (auth; Rust daemon only, `404` when the Mac app hasn't
+written it yet) → `{v, url, fallback?, lan?, remote_access, updated}`: the
+same addresses without the token, from
+`~/Library/Application Support/Baton/pairing.json` (the app rewrites it when
+Tailscale changes; `BATON_PAIRING_FILE` overrides the path).
+
+**iOS contract (to implement in the iPhone app):** after pairing, and on
+every launch/foreground, call `GET /api/pairing` over whichever address
+works and replace the stored `url`/`fallback`/`lan` with the answer; keep the
+token. Try `url` first (HTTPS, works away from home once remote access is
+on), then `lan`, then `fallback`. Treat `404` or a Python server (no
+`daemon` in `/api/health`) as "keep what you have".
+
 ## Session list
 
 `GET /api/local-sessions[?project=…]` → `{recent: [Row], momentum: [Row],

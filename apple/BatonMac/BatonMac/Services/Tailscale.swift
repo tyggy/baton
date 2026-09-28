@@ -93,6 +93,7 @@ final class TailscaleModel: ObservableObject {
         loading = true
         Task.detached {
             let i = TailscaleInfo.load()
+            Pairing.publish(ts: i)
             await MainActor.run {
                 self.info = i
                 self.loading = false

@@ -135,6 +135,7 @@ struct PairPage: View {
     let pinned: Bool
     let onDone: () -> Void
     let onNext: () -> Void
+    var laterTitle = "Pair Later"
     @State private var copied = false
 
     private var token: String? { Pairing.loadToken() }
@@ -145,7 +146,8 @@ struct PairPage: View {
             symbol: nil,
             title: watcher.connected ? "Your iPhone is connected" : "Scan with your iPhone",
             message: watcher.connected ? "You can use your sessions from your iPhone now." : "This code links Baton on your iPhone to this Mac.",
-            primaryTitle: watcher.connected ? "Continue" : "Done",
+            // No primary while waiting: a big button would invite skipping.
+            primaryTitle: watcher.connected ? "Continue" : nil,
             primary: onNext
         ) {
             VStack(spacing: 16) {
@@ -167,11 +169,16 @@ struct PairPage: View {
                 }
             }
         } links: {
-            if !watcher.connected, let payload {
-                Button(copied ? "Copied" : "Copy Pairing Code") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(payload, forType: .string)
-                    copied = true
+            if !watcher.connected {
+                HStack(spacing: 20) {
+                    if let payload {
+                        Button(copied ? "Copied" : "Copy Pairing Code") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(payload, forType: .string)
+                            copied = true
+                        }
+                    }
+                    Button(laterTitle, action: onNext)
                 }
             }
         }
@@ -180,6 +187,7 @@ struct PairPage: View {
             if !pinned { watcher.start() }
         }
         .onDisappear { watcher.stop() }
+        .animation(.spring(duration: 0.4), value: watcher.connected)
         .onChange(of: watcher.connected) { _, c in if c { onDone() } }
     }
 
@@ -352,7 +360,7 @@ struct FinishedPage: View {
             primaryTitle: "Done",
             primary: onClose
         ) {
-            MenuBarHint(symbol: model.menuSymbol)
+            MenuBarHint()
                 .padding(.top, 4)
         } links: {
             EmptyView()
@@ -366,32 +374,50 @@ struct FinishedPage: View {
     }
 }
 
-/// A small menu-bar picture pointing at Baton's icon.
+/// A crop of the right end of the menu bar, drawn like the real one (bar
+/// material, template glyphs in the label colour, the open item's rounded
+/// highlight), with an arrow at Baton's item — the same symbol as the real
+/// MenuBarExtra.
 struct MenuBarHint: View {
-    let symbol: String
     @State private var pulse = false
 
     var body: some View {
         VStack(spacing: 6) {
-            HStack(spacing: 16) {
-                Image(systemName: "wifi")
-                Image(systemName: symbol)
-                    .foregroundStyle(Color.accentColor)
-                    .padding(.horizontal, 7).padding(.vertical, 3)
-                    .background(Color.accentColor.opacity(0.18), in: Capsule())
-                Image(systemName: "battery.75percent")
-                Text("9:41").monospacedDigit()
+            HStack(spacing: 0) {
+                Spacer(minLength: 0)
+                HStack(spacing: 18) {
+                    Image(systemName: AppModel.menuSymbolRunning)
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(Color(nsColor: .labelColor).opacity(0.12),
+                                    in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                    Image(systemName: "wifi")
+                    Image(systemName: "battery.100percent")
+                    Image(systemName: "switch.2")
+                    Text("Sun 9:41")
+                }
+                .font(.system(size: 13, weight: .medium))
+                .imageScale(.medium)
+                .foregroundStyle(Color(nsColor: .labelColor))
+                .padding(.trailing, 14)
             }
-            .font(.system(size: 15))
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 18).padding(.vertical, 9)
-            .glassEffect(.regular, in: Capsule())
-            Image(systemName: "arrow.up")
-                .font(.title2.weight(.semibold))
-                .foregroundStyle(Color.accentColor)
-                .symbolEffect(.bounce.up, options: .repeat(2), value: pulse)
-                .offset(x: -22)
+            .frame(width: 330, height: 26)
+            .background(.bar)
+            .clipShape(UnevenRoundedRectangle(topLeadingRadius: 8, bottomLeadingRadius: 8,
+                                              bottomTrailingRadius: 0, topTrailingRadius: 0, style: .continuous))
+            .overlay(alignment: .bottom) { Divider() }
+            .mask(LinearGradient(colors: [.clear, .black, .black], startPoint: .leading, endPoint: .init(x: 0.35, y: 0.5)))
+            HStack {
+                Image(systemName: "arrow.up")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .symbolEffect(.bounce.up, options: .repeat(2), value: pulse)
+                    .padding(.leading, 116)
+                Spacer()
+            }
+            .frame(width: 330)
         }
         .onAppear { pulse = true }
+        .accessibilityElement()
+        .accessibilityLabel("Baton's icon in the menu bar")
     }
 }

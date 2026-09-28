@@ -77,9 +77,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let path = LaunchOptions.snapshot {
                 Task { @MainActor in
                     try? await Task.sleep(for: .seconds(4))
-                    // Legacy forced activation (snapshot mode only).
-                    NSApp.perform(NSSelectorFromString("activateIgnoringOtherApps:"), with: true)
-                    try? await Task.sleep(for: .seconds(2))
+                    guard await Snapshots.makeKey(windowID: LaunchOptions.show ?? "onboarding") else {
+                        FileHandle.standardError.write(Data("snapshot: window never became key; not writing an inactive-looking image\n".utf8))
+                        exit(3)
+                    }
                     await Snapshots.write(windowID: LaunchOptions.show ?? "onboarding", to: URL(fileURLWithPath: path))
                     NSApp.terminate(nil)
                 }
@@ -96,9 +97,12 @@ final class AppModel: ObservableObject {
     let tailscale = TailscaleModel()
     private var tsTimer: Timer?
 
+    static let menuSymbolRunning = "point.3.connected.trianglepath.dotted"
+    static let menuSymbolStopped = "point.3.filled.connected.trianglepath.dotted"
+
     var menuSymbol: String {
-        if case .running = daemon.liveness { return "point.3.connected.trianglepath.dotted" }
-        return "point.3.filled.connected.trianglepath.dotted"
+        if case .running = daemon.liveness { return Self.menuSymbolRunning }
+        return Self.menuSymbolStopped
     }
 
     func start() {
@@ -120,6 +124,26 @@ final class AppModel: ObservableObject {
 @MainActor
 enum Snapshots {
     private static var preview: NSWindow?
+
+    /// Snapshot mode only: force activation (the shell running the snapshot
+    /// is frontmost) and wait until the window is really key, so controls
+    /// render as the user sees them. Retries; false if it never happens.
+    static func makeKey(windowID: String) async -> Bool {
+        for _ in 0..<10 {
+            if let w = NSApp.windows.first(where: { $0.identifier?.rawValue.hasPrefix(windowID) == true && $0.isVisible }) {
+                NSApp.perform(NSSelectorFromString("activateIgnoringOtherApps:"), with: true)
+                w.makeKeyAndOrderFront(nil)
+                try? await Task.sleep(for: .milliseconds(700))
+                if NSApp.isActive && w.isKeyWindow {
+                    try? await Task.sleep(for: .milliseconds(600)) // let controls redraw as key
+                    if NSApp.isActive && w.isKeyWindow { return true }
+                }
+            } else {
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+        }
+        return false
+    }
 
     /// Settings content in a plain window (the Settings scene can't be opened
     /// programmatically at launch).

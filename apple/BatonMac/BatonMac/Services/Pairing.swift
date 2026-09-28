@@ -26,28 +26,65 @@ enum Pairing {
 
     static let fallbackPort = "19877"
 
-    /// Primary URL is the tailnet HTTPS name; the fallback is plain HTTP to
-    /// the tailnet IP, or to the LAN address when Tailscale isn't set up
-    /// (home Wi-Fi only).
-    static func payload(ts: TailscaleInfo?, token: String) -> String? {
-        let fallbackHost = ts?.ipv4 ?? lanIPv4()
-        let url: String
+    /// Addresses a phone should use. The Tailscale name is known as soon as
+    /// the Mac is on a tailnet — before remote access is turned on — so a
+    /// phone paired first still learns it; `lan` covers home Wi-Fi.
+    struct Addresses: Equatable {
+        var url: String
+        var fallback: String?
+        var lan: String?
+    }
+
+    static func addresses(ts: TailscaleInfo?) -> Addresses? {
+        let lan = lanIPv4().map { "http://\($0):\(fallbackPort)" }
+        let tsHTTP = ts?.ipv4.map { "http://\($0):\(fallbackPort)" }
         if let dns = ts?.dnsName {
-            url = "https://\(dns)"
-        } else if let host = fallbackHost {
-            url = "http://\(host):\(fallbackPort)"
-        } else {
-            return nil
+            return Addresses(url: "https://\(dns)", fallback: tsHTTP ?? lan, lan: lan)
         }
-        var obj: [(String, Any)] = [("v", 1), ("url", url)]
-        if let host = fallbackHost { obj.append(("fallback", "http://\(host):\(fallbackPort)")) }
-        obj.append(("token", token))
-        // Stable key order (JSONSerialization doesn't keep insertion order).
-        let parts = obj.map { k, v -> String in
+        guard let first = tsHTTP ?? lan else { return nil }
+        return Addresses(url: first, fallback: tsHTTP == nil ? nil : lan, lan: lan)
+    }
+
+    /// `{"v":1,"url":…,"fallback":…,"lan":…,"token":…}` — keys in this order.
+    static func payload(ts: TailscaleInfo?, token: String) -> String? {
+        guard let a = addresses(ts: ts) else { return nil }
+        var pairs: [(String, Any)] = [("v", 1), ("url", a.url)]
+        if let f = a.fallback { pairs.append(("fallback", f)) }
+        if let l = a.lan { pairs.append(("lan", l)) }
+        pairs.append(("token", token))
+        return encode(pairs)
+    }
+
+    /// `pairing.json` for the daemon's `GET /api/pairing` (no token): phones
+    /// re-read it after pairing, so the order of pairing and remote access
+    /// doesn't matter (docs/api.md).
+    static func publish(ts: TailscaleInfo?) {
+        guard !LaunchOptions.isSnapshot, let a = addresses(ts: ts) else { return }
+        var pairs: [(String, Any)] = [("v", 1), ("url", a.url)]
+        if let f = a.fallback { pairs.append(("fallback", f)) }
+        if let l = a.lan { pairs.append(("lan", l)) }
+        pairs.append(("remote_access", ts.map { $0.servePorts.isEmpty ? false : true } ?? false))
+        pairs.append(("updated", ISO8601DateFormatter().string(from: Date())))
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Baton/pairing.json")
+        let text = encode(pairs) + "\n"
+        if (try? String(contentsOf: url, encoding: .utf8))?.replacingOccurrences(
+            of: #""updated":"[^"]*""#, with: "", options: .regularExpression)
+            == text.replacingOccurrences(of: #""updated":"[^"]*""#, with: "", options: .regularExpression) {
+            return // unchanged apart from the timestamp
+        }
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? text.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private static func encode(_ pairs: [(String, Any)]) -> String {
+        let parts = pairs.map { k, v -> String in
             let val: String
             if let s = v as? String {
                 let enc = (try? JSONSerialization.data(withJSONObject: s, options: .fragmentsAllowed)) ?? Data()
                 val = String(decoding: enc, as: UTF8.self)
+            } else if let b = v as? Bool {
+                val = b ? "true" : "false"
             } else {
                 val = "\(v)"
             }
