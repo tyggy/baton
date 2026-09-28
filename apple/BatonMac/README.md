@@ -108,8 +108,10 @@ Screenshots: `docs/clip-hud-{opened,choose}-light.png`,
 The LaunchAgent has fixed arguments:
 `baton serve --config ~/Library/Application Support/Baton/daemon.conf`
 (the daemon expands `~/`). The app writes `listen=` / `upstream=` there
-before each start. Defaults are the shadow setup, `127.0.0.1:19880` →
-upstream `http://127.0.0.1:19877`. Daemon logs go to `~/Library/Logs/Baton`
+before each start; those two keys override `~/.config/baton/config.toml`,
+which holds everything else (docs/config.md). Defaults are the shadow setup:
+listen on `BatonPorts.sidecar`, upstream = the Python server on
+`BatonPorts.standard` (Daemon.swift). Daemon logs go to `~/Library/Logs/Baton`
 (`BATON_LOG_DIR`), stdout/stderr to `/tmp/baton-daemon.{out,err}.log`.
 
 ## Launch arguments (scripted checks)

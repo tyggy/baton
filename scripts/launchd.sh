@@ -1,7 +1,10 @@
 #!/bin/bash
-# Install / remove `baton serve` as a login LaunchAgent.
+# Install / remove `baton serve` as a login LaunchAgent — the developer
+# variant with versioned releases. Users run `baton setup` instead (same
+# label, plain binary path). Listen/upstream come from
+# ~/.config/baton/config.toml unless given here (docs/config.md).
 #
-#   scripts/launchd.sh install <path-to-baton-binary> [--listen 0.0.0.0:19877] [--upstream http://127.0.0.1:19878]
+#   scripts/launchd.sh install <path-to-baton-binary> [--listen HOST:PORT] [--upstream URL]
 #   scripts/launchd.sh uninstall
 #   scripts/launchd.sh status
 #
@@ -18,10 +21,15 @@ cmd="${1:-status}"; shift || true
 case "$cmd" in
   install)
     bin="${1:?binary path}"; shift
-    listen="0.0.0.0:19877"; upstream="http://127.0.0.1:19878"
+    listen=""; upstream=""
     while [[ $# -gt 0 ]]; do
       case "$1" in --listen) listen="$2"; shift 2;; --upstream) upstream="$2"; shift 2;; *) echo "unknown $1"; exit 2;; esac
     done
+    extra=""
+    [[ -n "$listen" ]] && extra+="
+    <string>--listen</string><string>$listen</string>"
+    [[ -n "$upstream" ]] && extra+="
+    <string>--upstream</string><string>$upstream</string>"
     id="$(date +%Y%m%d-%H%M%S)-$( ("$bin" 2>&1 || true) | head -1 | awk '{print $2}')"
     mkdir -p "$BASE/releases/$id"
     cp "$bin" "$BASE/releases/$id/baton"
@@ -32,9 +40,7 @@ case "$cmd" in
 <plist version="1.0"><dict>
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key><array>
-    <string>$BASE/current/baton</string><string>serve</string>
-    <string>--listen</string><string>$listen</string>
-    <string>--upstream</string><string>$upstream</string>
+    <string>$BASE/current/baton</string><string>serve</string>$extra
   </array>
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
@@ -49,7 +55,7 @@ case "$cmd" in
 PL
     launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
     launchctl bootstrap "$DOMAIN" "$PLIST"
-    echo "installed $id → $listen (upstream $upstream)"
+    echo "installed $id → ${listen:-config listen} (upstream ${upstream:-from config})"
     ;;
   uninstall)
     launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true

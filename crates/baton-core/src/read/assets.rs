@@ -9,22 +9,22 @@ use std::sync::OnceLock;
 pub const ASSET_MAX_BYTES: u64 = 100 << 20;
 pub const ASSET_GZIP_MAX: u64 = 32 << 20;
 
-const DEFAULT_ROOTS: [&str; 8] = [
-    "~/Documents",
-    "~/Downloads",
-    "~/Desktop",
-    "/tmp",
-    "~/GitHub",
-    "~/Superapp-Projects",
-    "~/.baton/pastes",
-    "~/.claude/plans",
-];
+/// Default roots: the home dir (minus its hidden top-level entries and
+/// `~/Library`, see [`AssetPolicy::hide_home_private`]) plus the two
+/// hidden dirs Baton itself writes attachments to. Secrets are refused
+/// under every root. The Python reference had a fixed personal list here;
+/// that list now lives in its user's config (`asset_roots`).
+const DEFAULT_ROOTS: [&str; 3] = ["~", "~/.baton/pastes", "~/.claude/plans"];
 
 #[derive(Clone, Debug)]
 pub struct AssetPolicy {
     /// `str(Path(p).expanduser())` of each root.
     pub roots: Vec<String>,
     pub home: String,
+    /// Default roots only: a path reached through the home-dir root must not
+    /// sit under a hidden top-level entry (`~/.ssh`, `~/.config`, …) or
+    /// `~/Library` (keychains, mail, cookies).
+    pub hide_home_private: bool,
 }
 
 /// `str(PurePosixPath(p))`: collapse repeated slashes and "." parts, drop
@@ -53,15 +53,19 @@ impl AssetPolicy {
     /// Roots from `CSM_ASSET_ROOTS` (comma-separated) or the defaults.
     pub fn new(home: &str, env_roots: Option<&str>) -> Self {
         let raw = env_roots.map(str::trim).unwrap_or("");
-        let list: Vec<String> = if raw.is_empty() {
-            DEFAULT_ROOTS.iter().map(|s| s.to_string()).collect()
-        } else {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect()
-        };
+        let list: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        Self::with_roots(home, (!list.is_empty()).then_some(list))
+    }
+
+    /// Explicit roots (`asset_roots` in the config), or the defaults.
+    pub fn with_roots(home: &str, roots: Option<Vec<String>>) -> Self {
+        let hide_home_private = roots.is_none();
+        let list = roots.unwrap_or_else(|| DEFAULT_ROOTS.iter().map(|s| s.to_string()).collect());
         let roots = list
             .iter()
             .map(|r| {
@@ -79,6 +83,7 @@ impl AssetPolicy {
         AssetPolicy {
             roots,
             home: home.to_string(),
+            hide_home_private,
         }
     }
 
@@ -89,8 +94,23 @@ impl AssetPolicy {
         if is_secret_path(&resolved) {
             return None;
         }
+        let home = if self.hide_home_private {
+            realpath(&self.home)
+        } else {
+            None
+        };
         for rroot in self.resolved_roots() {
             if resolved == rroot || resolved.starts_with(&format!("{rroot}/")) {
+                if home.as_deref() == Some(rroot.as_str()) {
+                    let first = resolved[rroot.len()..]
+                        .trim_start_matches('/')
+                        .split('/')
+                        .next()
+                        .unwrap_or("");
+                    if first.starts_with('.') || first == "Library" {
+                        continue;
+                    }
+                }
                 return Some(resolved);
             }
         }
@@ -183,5 +203,48 @@ mod tests {
         }
         assert_eq!(pathlib_str("/tmp/"), "/tmp");
         assert_eq!(pathlib_str("~/a//./b"), "~/a/b");
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn default_roots_are_home_minus_private() {
+        let base = std::env::temp_dir().join(format!("baton-assets-{}", std::process::id()));
+        let home = base.join("home");
+        let files = [
+            "Documents/a.txt",
+            "Music/b.txt",
+            ".ssh/c.txt",
+            ".config/baton/token.txt",
+            "Library/Keychains/k.txt",
+            ".baton/pastes/p.txt",
+            ".claude/plans/q.md",
+            "proj/.env",
+        ];
+        for f in files {
+            let p = home.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "x").unwrap();
+        }
+        std::fs::write(base.join("outside.txt"), "x").unwrap();
+        let h = home.to_string_lossy().into_owned();
+        let pol = AssetPolicy::with_roots(&h, None);
+        let ok = |f: &str| pol.path_under_allowed_root(&format!("{h}/{f}")).is_some();
+        assert!(ok("Documents/a.txt") && ok("Music/b.txt"));
+        assert!(ok(".baton/pastes/p.txt") && ok(".claude/plans/q.md"));
+        assert!(!ok(".ssh/c.txt") && !ok(".config/baton/token.txt"));
+        assert!(!ok("Library/Keychains/k.txt") && !ok("proj/.env"));
+        assert!(pol
+            .path_under_allowed_root(&base.join("outside.txt").to_string_lossy())
+            .is_none());
+        // Explicit roots: exactly those (secrets still refused).
+        let pol = AssetPolicy::with_roots(&h, Some(vec!["~/Documents".into(), "~/.config".into()]));
+        let ok = |f: &str| pol.path_under_allowed_root(&format!("{h}/{f}")).is_some();
+        assert!(ok("Documents/a.txt") && ok(".config/baton/token.txt"));
+        assert!(!ok("Music/b.txt"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

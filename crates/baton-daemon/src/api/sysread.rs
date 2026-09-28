@@ -195,7 +195,8 @@ async fn orphans(state: &Arc<State>, h: &HeaderMap) -> Response<Body> {
             h,
         );
     };
-    let tty_map = load_tty_map(&state.home.join(".claude/tty_session_map.json"));
+    let tty_map =
+        load_tty_map(&baton_core::settings::claude_dir(&state.home).join("tty_session_map.json"));
     let now = logs::unix_now();
     let mut seen = HashSet::new();
     let mut out: Vec<(i64, Py)> = Vec::new();

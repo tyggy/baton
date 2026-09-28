@@ -20,6 +20,9 @@ Runs `baton serve` on 127.0.0.1:19881 in front of the live Python server
 4. Timings: Rust cold / warm rebuild (daemon log) vs Python's (its event
    log), request latency for both.
 
+`--readonly` skips the throwaway-transcript part of 3 (the only step that
+writes outside a temp dir).
+
 Exit 0 when everything passes.
 """
 import gzip, json, os, re, shutil, signal, socket, statistics, subprocess, sys, tempfile, threading, time, uuid
@@ -309,8 +312,11 @@ def run(tmp, procs):
     print(f"   GET /api/local-sessions (gzip, cached): python {lat['python']:.1f} ms, rust {lat['rust']:.1f} ms (median of 15)")
 
     # ── live deltas (real home, throwaway transcript) ──
-    print("\n/api/events (throwaway transcript in the real projects dir)")
-    live_deltas(log)
+    if "--readonly" in sys.argv:
+        print("\n/api/events (real projects dir): skipped (--readonly)")
+    else:
+        print("\n/api/events (throwaway transcript in the real projects dir)")
+        live_deltas(log)
 
     # ── live deltas (isolated HOME, deterministic rows) ──
     print("\n/api/events (isolated HOME, new row → changed / removed)")

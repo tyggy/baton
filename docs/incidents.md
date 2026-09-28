@@ -7,7 +7,7 @@ from it.
 
 **Sources:** the user's messages in Claude Code sessions `d4039fa0` (search-hub project, Apr–Sep),
 `297f2d18` (Apr, iPhone remote phases 2–9), `70a9a2ba` (May, Baton connect/voice), and the
-watcher sessions `23b56636` / `48025373` / `77a60279`. Git history of `workbench-exporter-master`
+watcher sessions `23b56636` / `48025373` / `77a60279`. Git history of the prototype repo
 (incl. `baton-evolution`), `~/Superapp-Projects/baton`, `~/GitHub/baton` (`port/*`,
 `integration`), and search-hub. `~/Library/Application Support/cs-server/deploys.jsonl`.
 Logs: `cs-server.{requests,errors,client,events}.jsonl`, `cs-server.err.log`,
@@ -104,7 +104,7 @@ cosmetic / annoyance.
   - 4× `api_server.py: error: unrecognized arguments: 19877 127.0.0.1`. Something (the plist, or
     `scripts/launchd.sh` in the monorepo) passes positional port/host, but argparse only accepts
     `--port/--host`.
-  - `InterruptedError: [Errno 4] Interrupted system call: '~/Documents/Claude/work'`, raised at
+  - `InterruptedError: [Errno 4] Interrupted system call: '<kb_path>/work'`, raised at
     **import time** from `sessions_core.py:98 build_folder_tree` (called at module level, line 120,
     imported from `api_server.py:59`). An import that walks `~/Documents` (iCloud, TCC) can block
     under launchd's environment.
@@ -856,7 +856,7 @@ INC-037 (incremental parse exception escaping) belongs to the same family and is
 - **Date:** 2026-09-27, 11:34–11:36.
 - **Component:** infra, Baton iOS.
 - **Symptom:** the computer name drifted to "MacBook Pro (10)" and the local name to
-  `MacBook-Pro-109`. The Baton fallback and Tailscale names diverged, and the user asked
+  `MacBook-Pro-<n>`. The Baton fallback and Tailscale names diverged, and the user asked
   *"should we rename our mac so automatic rename scheme is not failing our name"*.
 - **Root cause:** a generic hostname plus Bonjour conflict renaming.
 - **Fix:** renamed the Mac; the Baton default fallback was updated plus a migration.

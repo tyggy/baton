@@ -590,6 +590,9 @@ fn logo_path_of(e: &Py) -> Option<String> {
 
 /// Native unless Python has to refresh the catalog or fetch from Airtable.
 fn logo_is_local(state: &State, id: Option<&str>) -> bool {
+    if !baton_core::settings::get().entities {
+        return true; // integration off: answered natively (404)
+    }
     let Some(id) = id else {
         return true; // 400 id required
     };
@@ -606,6 +609,13 @@ fn entity_logo(state: &State, id: Option<&str>, h: &HeaderMap) -> HResult {
     let Some(id) = id else {
         return Ok(err_json(StatusCode::BAD_REQUEST, "id required", h));
     };
+    if !baton_core::settings::get().entities {
+        return Ok(err_json(
+            StatusCode::NOT_FOUND,
+            "entity catalog disabled (set entities = true in the config)",
+            h,
+        ));
+    }
     let catalog = fresh_catalog(state).unwrap_or_default();
     let Some(entity) = find_entity(&catalog, id) else {
         return Ok(err_json(StatusCode::NOT_FOUND, "entity not found", h));
@@ -792,7 +802,7 @@ const READY_MARKERS: [&str; 6] = [
 static CALIB_LOCK: Mutex<()> = Mutex::new(());
 
 fn calib_file(home: &Path) -> PathBuf {
-    home.join(".claude/resume_calibration.json")
+    baton_core::settings::claude_dir(home).join("resume_calibration.json")
 }
 
 fn num(v: Option<&Py>) -> Option<f64> {
@@ -909,9 +919,10 @@ fn resolve_session_cwd(projects: &Path, session_id: &str, home: &Path) -> Option
 /// `_haiku_title_for` ("" when unclassified).
 fn haiku_title_for(home: &Path, session_id: &str) -> Result<String, Fail> {
     let at = "_haiku_title_for";
-    let Some(cache) = std::fs::read(home.join(".claude/session_classifications.json"))
-        .ok()
-        .and_then(|b| Py::loads(&b).ok())
+    let Some(cache) =
+        std::fs::read(baton_core::settings::claude_dir(home).join("session_classifications.json"))
+            .ok()
+            .and_then(|b| Py::loads(&b).ok())
     else {
         return Ok(String::new());
     };
@@ -954,10 +965,12 @@ enum Origin {
 /// Which agent wrote the session (INC-012): a Claude transcript under
 /// `~/.claude/projects` wins, else a Codex rollout under `~/.codex/sessions`.
 fn locate_transcript(home: &Path, id: &str) -> Option<(Origin, PathBuf)> {
-    if let Some(p) = find_session_jsonl(&home.join(".claude/projects"), id) {
+    let claude = baton_core::settings::claude_dir(home).join("projects");
+    if let Some(p) = find_session_jsonl(&claude, id) {
         return Some((Origin::Claude, p));
     }
-    find_codex_rollout(&home.join(".codex/sessions"), id).map(|p| (Origin::Codex, p))
+    let codex = baton_core::settings::codex_dir(home).join("sessions");
+    find_codex_rollout(&codex, id).map(|p| (Origin::Codex, p))
 }
 
 /// `<root>/YYYY/MM/DD/rollout-<ts>-<id>.jsonl`, newest directory first.
@@ -1201,7 +1214,7 @@ async fn resume(state: &Arc<State>, body: Py, h: &HeaderMap) -> HResult {
     let cwd = match origin {
         Origin::Claude => {
             let (p, s, hm) = (
-                state.home.join(".claude/projects"),
+                baton_core::settings::claude_dir(&state.home).join("projects"),
                 session_id.clone(),
                 state.home.clone(),
             );

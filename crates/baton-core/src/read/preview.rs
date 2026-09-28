@@ -584,8 +584,10 @@ pub fn claude_preview(
     let mut started_at = String::new();
     let mut last_at = String::new();
     let mut turn_count: i64 = 0;
-    let cached = super::paths::glob(&cfg.sessions_cache_dir, &format!("*/{session_id}.md"))
-        .ok()
+    let cached = cfg
+        .sessions_cache_dir
+        .as_ref()
+        .and_then(|d| super::paths::glob(d, &format!("*/{session_id}.md")).ok())
         .and_then(|v| v.into_iter().next());
     if let Some(c) = cached {
         let fresh = match (std::fs::metadata(&c), std::fs::metadata(jsonl)) {

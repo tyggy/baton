@@ -2,7 +2,6 @@ name: ci
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 jobs:
@@ -13,6 +12,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all
+      - run: cargo build --release --locked
+      - run: cargo test --all --locked
+      # The CLI a new user runs first, against an empty HOME (no launchctl).
+      - name: baton setup / doctor smoke test
+        run: |
+          export HOME="$(mktemp -d)"
+          ./target/release/baton setup --yes --skip-launchctl --no-qr --listen 127.0.0.1:19999
+          test -f "$HOME/.config/baton/config.toml"
+          test "$(stat -f %Lp "$HOME/.config/baton/token")" = 600
+          ./target/release/baton doctor --bundle "$RUNNER_TEMP/doctor.tar.gz"
+          tar -tzf "$RUNNER_TEMP/doctor.tar.gz"

@@ -3,14 +3,29 @@ import CoreImage
 import CoreImage.CIFilterBuiltins
 
 /// Pairing payload for the iPhone app (the iOS side comes later):
-/// `{"v":1,"url":"https://<magicdns>","fallback":"http://<ts ipv4>:19877","token":"…"}`
+/// `{"v":1,"url":"https://<magicdns>","fallback":"http://<ts ipv4>:<port>","token":"…"}`
+/// (`baton setup` / `baton pair` print the same payload: cli/pairing.rs).
 enum Pairing {
-    /// `BATON_BEARER` from `~/.claude-sessions/config` (same parsing as the daemon).
+    /// The daemon's bearer token, same order as the daemon (`state::load_token`):
+    /// `BATON_BEARER`, the token file `baton setup` writes
+    /// (`$XDG_CONFIG_HOME/baton/token`, default `~/.config/baton/token`), then
+    /// `BATON_BEARER=` in the Python server's `~/.claude-sessions/config`.
     static func loadToken() -> String? {
         // Screenshots never carry the real token (the QR encodes it).
         if LaunchOptions.isSnapshot { return "snapshot-placeholder-token" }
-        if let env = ProcessInfo.processInfo.environment["BATON_BEARER"], !env.isEmpty { return env }
-        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude-sessions/config")
+        let env = ProcessInfo.processInfo.environment
+        if let t = env["BATON_BEARER"], !t.isEmpty { return t }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let configDir: URL = if let x = env["XDG_CONFIG_HOME"], x.hasPrefix("/") {
+            URL(fileURLWithPath: x).appendingPathComponent("baton")
+        } else {
+            home.appendingPathComponent(".config/baton")
+        }
+        if let t = try? String(contentsOf: configDir.appendingPathComponent("token"), encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
+            return t
+        }
+        let url = home.appendingPathComponent(".claude-sessions/config")
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
         var token: String?
         for raw in text.split(whereSeparator: \.isNewline) {
@@ -24,7 +39,7 @@ enum Pairing {
         return (token?.isEmpty ?? true) ? nil : token
     }
 
-    static let fallbackPort = "19877"
+    static let fallbackPort = String(BatonPorts.standard)
 
     /// Addresses a phone should use. The Tailscale name is known as soon as
     /// the Mac is on a tailnet — before remote access is turned on — so a

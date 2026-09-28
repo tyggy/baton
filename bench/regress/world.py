@@ -284,6 +284,15 @@ class World:
 
     def _assets(self):
         h = self.home
+        # The daemon's default asset roots are the home dir minus private
+        # dirs; the Python reference has a fixed list. The sandbox daemon
+        # gets that list through its config file — what `baton setup`
+        # migrates for an existing install (docs/migrating.md) — so the
+        # "outside every root" cases below stay meaningful for both.
+        cfg = h / ".config/baton/config.toml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text('asset_roots = ["~/Documents", "~/Downloads", "~/Desktop", "/tmp", "~/GitHub",\n'
+                       '               "~/Superapp-Projects", "~/.baton/pastes", "~/.claude/plans"]\n')
         self.asset_ok = {}
         for root in ("Documents", "Downloads", "Desktop", "GitHub/repo", "Superapp-Projects",
                      ".baton/pastes", ".claude/plans"):

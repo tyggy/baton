@@ -1,9 +1,12 @@
-//! `baton` — the Baton daemon (`baton serve`); TUI and setup come later
-//! (PLAN.md). Native endpoints live in `api/`; anything they don't claim is
-//! forwarded to the Python reference server until the migration is done.
+//! `baton` — the Baton daemon (`baton serve`) and its setup tools
+//! (`setup`, `pair`, `doctor`; PLAN.md M3). Native endpoints live in `api/`;
+//! anything they don't claim goes to the optional Python upstream, or gets a
+//! 501 when none is configured.
 
 mod api;
+mod cli;
 mod cmd;
+mod config;
 mod http;
 mod logs;
 mod proxy;
@@ -19,51 +22,39 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-const USAGE: &str = "usage: baton serve [--listen 127.0.0.1:19880] [--upstream http://127.0.0.1:19877] [--relay URL] [--config FILE]\n       baton sessions   (session list as JSON)";
+const USAGE: &str = "usage: baton <command>
 
-fn flag(args: &[String], name: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-}
+  serve    run the daemon
+           [--listen ADDR] [--upstream URL|none] [--relay URL] [--config FILE]
+           [--claude-dir DIR] [--codex-dir DIR] [--kb-path DIR]
+  setup    first-run setup: config, token, login service, pairing QR (--help)
+  pair     print the pairing QR code and code again
+  doctor   diagnose the install; --bundle writes a redacted bug-report archive
+  config   print the effective config and where each value comes from
+  sessions session list as JSON
+
+Config: ~/.config/baton/config.toml (docs/config.md). Precedence: flags > env > file > defaults.";
 
 /// `~/…` → `$HOME/…`. launchd doesn't expand `~`, and the Mac app's
 /// LaunchAgent plist can't know the user's home at build time.
 pub fn expand_home(p: &str) -> std::path::PathBuf {
-    match p.strip_prefix("~/") {
-        Some(rest) => {
-            std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest)
-        }
-        None => std::path::PathBuf::from(p),
+    config::expand(p)
+}
+
+fn load_config(args: &[String]) -> config::Config {
+    let cfg = config::Config::load(args);
+    for w in &cfg.warnings {
+        eprintln!("baton: {w}");
     }
+    cfg.install();
+    cfg
 }
 
-/// `--config FILE`: `key=value` lines (`listen`, `upstream`), written by the
-/// Mac app so its bundled LaunchAgent can keep fixed arguments. A missing
-/// file means defaults. Explicit flags win over the file.
-fn config_value(args: &[String], key: &str) -> Option<String> {
-    let path = flag(args, "--config")?;
-    let text = std::fs::read_to_string(expand_home(&path)).ok()?;
-    text.lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .filter(|(k, _)| k.trim() == key)
-        .map(|(_, v)| v.trim().to_string())
-        .rfind(|v| !v.is_empty())
-}
-
-fn arg(args: &[String], name: &str, default: &str) -> String {
-    flag(args, name)
-        .or_else(|| config_value(args, name.trim_start_matches("--")))
-        .unwrap_or_else(|| default.to_string())
-}
-
-#[tokio::main]
-async fn main() {
+fn main() {
     let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
+    let code = match args.get(1).map(String::as_str) {
         Some("sessions") => {
+            load_config(&args);
             let t0 = std::time::Instant::now();
             let (sessions, headless) =
                 baton_core::sessions::build_all(&baton_core::sessions::Dirs::default_home(), None);
@@ -77,33 +68,69 @@ async fn main() {
                 "{}",
                 serde_json::json!({"sessions": sessions, "headless": headless})
             );
+            0
         }
-        Some("serve") => serve(&args).await,
+        Some("serve") => {
+            let cfg = load_config(&args);
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+                .block_on(serve(cfg));
+            0
+        }
+        Some("setup") => cli::setup::main(&args),
+        Some("pair") => cli::setup::pair(&args),
+        Some("doctor") => cli::doctor::main(&args),
+        Some("config") => {
+            let cfg = config::Config::load(&args);
+            print!("{}", cfg.to_toml());
+            println!("\n# sources:");
+            for (k, s) in &cfg.sources {
+                println!("#   {k:<15} {s}");
+            }
+            for w in &cfg.warnings {
+                println!("# warning: {w}");
+            }
+            0
+        }
+        Some("--version" | "-V" | "version") => {
+            println!("baton {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
+        Some("--help" | "-h" | "help") => {
+            println!("baton {}\n{USAGE}", env!("CARGO_PKG_VERSION"));
+            0
+        }
         _ => {
             eprintln!("baton {}\n{USAGE}", env!("CARGO_PKG_VERSION"));
-            std::process::exit(2);
+            2
         }
-    }
+    };
+    std::process::exit(code);
 }
 
-async fn serve(args: &[String]) {
-    let listen: SocketAddr = arg(args, "--listen", "127.0.0.1:19880")
-        .parse()
-        .expect("--listen host:port");
-    let upstream_url = arg(args, "--upstream", "http://127.0.0.1:19877");
-    // Push relay: BATON_RELAY_URL, else --relay / `relay=` in --config.
-    let relay = Some(arg(args, "--relay", "")).filter(|r| !r.is_empty());
-    let state = Arc::new(state::State::new(
-        proxy::Upstream::new(&upstream_url),
-        relay,
-    ));
+async fn serve(cfg: config::Config) {
+    let listen: SocketAddr = match cfg.listen.parse() {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("baton: listen `{}` is not host:port", cfg.listen);
+            std::process::exit(2);
+        }
+    };
+    let upstream = cfg.upstream.clone();
+    let state = Arc::new(state::State::new(cfg));
     let listener = TcpListener::bind(listen).await.expect("bind");
     tokio::spawn(api::list::prewarm(state.clone()));
     tokio::spawn(state.push.clone().run(state.events.subscribe()));
     eprintln!(
-        "baton serve on {listen} (upstream {upstream_url}, auth {})",
+        "baton serve on {listen} (upstream {}, auth {})",
+        upstream.as_deref().unwrap_or("none"),
         if state.token.is_empty() { "off" } else { "on" }
     );
+    if state.token.is_empty() && !listen.ip().is_loopback() {
+        eprintln!("baton: warning: no bearer token and listening on {listen}; run `baton setup`");
+    }
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             continue;

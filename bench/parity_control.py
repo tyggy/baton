@@ -285,6 +285,9 @@ class Side:
         self.shim = self.root / "shim"
         for d in (self.home, self.tmuxdir, self.osa, self.home / "proj", self.shim):
             d.mkdir(parents=True, exist_ok=True)
+        # The entity catalog is opt-in for the daemon (Python always reads it).
+        (self.home / ".config/baton").mkdir(parents=True, exist_ok=True)
+        (self.home / ".config/baton/config.toml").write_text("entities = true\n")
         real = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
         (self.shim / "tmux").write_text(
             "#!/bin/sh\n"

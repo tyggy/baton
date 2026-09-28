@@ -78,8 +78,11 @@ benchmarks show it at least as fast.
 - Pairing QR, status, embedded terminal, window management.
 
 **M3 — installable by others**
-- `baton setup/pair/doctor`; config file (no personal paths or hosts).
-- cargo-dist: curl installer, Homebrew tap, GitHub Releases; notarized app + cask.
+- [x] `baton setup/pair/doctor`; config file (no personal paths or hosts) —
+  docs/config.md, docs/migrating.md.
+- [x] cargo-dist configured: curl installer, Homebrew tap (`tyggy/homebrew-baton`),
+  GitHub Releases (`dist-workspace.toml`, `release.yml`). Not yet: first tag, tap repo.
+- [ ] Notarized app + cask.
 - Relay (Cloudflare Worker) + end-to-end encrypted notifications.
 - iOS: QR pairing, demo mode (App Review + first run), HTTPS only.
 - TestFlight beta, 5–10 users.

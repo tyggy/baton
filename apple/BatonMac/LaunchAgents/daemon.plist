@@ -3,7 +3,8 @@
 <!-- Template: embed-daemon.sh substitutes __LABEL__ and __BUNDLE_ID__ and
      installs it as Contents/Library/LaunchAgents/<label>.plist.
      Arguments are fixed; the app writes listen/upstream to the config file
-     (default: 127.0.0.1:19880, upstream http://127.0.0.1:19877). -->
+     (defaults: DaemonController.defaultListen / defaultUpstream). The daemon
+     also reads ~/.config/baton/config.toml underneath it (docs/config.md). -->
 <plist version="1.0">
 <dict>
 	<key>Label</key>

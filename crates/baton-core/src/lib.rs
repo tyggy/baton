@@ -12,6 +12,7 @@ pub mod pyjson;
 /// to be unified with `pyjson` after the migration.
 pub mod pyjson_read;
 pub mod sessions;
+pub mod settings;
 pub mod tmuxmap;
 
 use serde_json::Value;
