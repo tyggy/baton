@@ -33,10 +33,10 @@ INTENDED = ("/api/pairing", "/api/browse")
 SKIP = ("/api/events", "/api/tail/", "/api/pane-stream/", "/api/bench", "/api/voice")
 
 
-def recent_paths(n):
+def recent_paths(n, log=None):
     """The n most recent distinct phone GET paths (non-local clients)."""
     seen, out = set(), []
-    for line in reversed(REQ_LOG.read_text(errors="replace").splitlines()[-40000:]):
+    for line in reversed(Path(log or REQ_LOG).read_text(errors="replace").splitlines()[-40000:]):
         try:
             r = json.loads(line)
         except Exception:
@@ -81,6 +81,8 @@ def main():
     ap.add_argument("--py", default="http://127.0.0.1:19877")
     ap.add_argument("--daemon", default="http://127.0.0.1:19880")
     ap.add_argument("--n", type=int, default=150)
+    ap.add_argument("--requests", help="request log to replay (default: the Python server's; "
+                    "after the cut-over, ~/Library/Logs/Baton/cs-server.requests.jsonl)")
     ap.add_argument("--log", default=str(Path.home() / "Library/Logs/Baton/shadow.jsonl"))
     a = ap.parse_args()
     token = live_token()
@@ -89,7 +91,7 @@ def main():
         print("shadow daemon not answering", file=sys.stderr)
         return 2
     counts, diffs, ms = Counter(), [], {"py": [], "daemon": []}
-    for p in recent_paths(a.n):
+    for p in recent_paths(a.n, a.requests):
         r1, rd, r2 = py.get(p, timeout=20), dm.get(p, timeout=20), py.get(p, timeout=20)
         ms["py"].append(r1.ms)
         ms["daemon"].append(rd.ms)
