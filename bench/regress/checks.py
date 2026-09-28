@@ -1215,10 +1215,11 @@ def orphans_fast(ctx):
 @check("INC-049", mode=SANDBOX, name="tmux-arg-separator")
 def tmux_arg_separator(ctx):
     """A key or message ending in `;` reaches the pane literally: tmux reads a trailing `;` as a command separator, so send-key ["x;", "kill-server"] must not run kill-server."""
-    if ctx.impl == "python":
-        # Python passes the argument through: this would kill the sandbox
-        # tmux server and take the rest of the run with it.
-        raise Skip("python: known to split on a trailing ';' (INC-049); not run")
+    if ctx.impl == "python" and not os.environ.get("REGRESS_PY_ESCAPES_SEMICOLON"):
+        # Python before ef47f69+1 passed the argument through: this would kill
+        # the sandbox tmux server and take the rest of the run with it. Set
+        # REGRESS_PY_ESCAPES_SEMICOLON=1 when --ref has _tmux_escape_separators.
+        raise Skip("python: set REGRESS_PY_ESCAPES_SEMICOLON=1 for a ref with the escape fix")
     w = ctx.world
     pane, log = w.panes["send"], w.app_log["send"]
     n0 = nlines(log)
