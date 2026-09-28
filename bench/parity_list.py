@@ -521,7 +521,10 @@ def relay(tmp, procs):
     try:
         home = tmp / "home-relay"
         (home / ".claude/projects").mkdir(parents=True)
-        procs.append(start_daemon(RELAY_PORT, tmp / "relay.log", {"HOME": str(home), "BATON_BEARER": TOK}, FAKE_UP_PORT))
+        # Relaying Python's event stream is opt-in since every event source is native.
+        procs.append(start_daemon(RELAY_PORT, tmp / "relay.log",
+                                  {"HOME": str(home), "BATON_BEARER": TOK, "BATON_RELAY_UPSTREAM_EVENTS": "1"},
+                                  FAKE_UP_PORT))
         events, stop = [], threading.Event()
         threading.Thread(target=sse, args=(RELAY_PORT, events, stop), daemon=True).start()
         time.sleep(8)
@@ -532,8 +535,9 @@ def relay(tmp, procs):
               f"upstream events relayed ({len(hooks)} hook events)")
         check(not any(e.get("etag") == "upstream" for e in evs), "upstream sessions_delta not relayed (native)")
         ups = [e for e in evs if e.get("type") == "sessions_update"]
-        check(ups and all(e["sessions"] == [{"name": "fake-tmux", "status": "idle"}] for e in ups),
-              f"sessions_update from upstream /api/sessions ({len(ups)} in 8 s), upstream's own not relayed")
+        # sessions_update is native now (tmux group's get_sessions), never the upstream's.
+        check(ups and not any(e["sessions"] == [{"name": "fake-tmux", "status": "idle"}] for e in ups),
+              f"sessions_update native ({len(ups)} in 8 s), upstream's own not relayed")
     finally:
         srv.shutdown()
 
