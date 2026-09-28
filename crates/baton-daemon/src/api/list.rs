@@ -75,6 +75,9 @@ struct Engine {
     inflight: Mutex<HashSet<Key>>,
     built: tokio::sync::Notify,
     headless: Mutex<Headless>,
+    /// Ids of the unfiltered `load_all_sessions(None)` list from the last
+    /// build (for `/api/orphans`).
+    known: Mutex<Option<Arc<HashSet<String>>>>,
     last_poll_ms: AtomicU64,
     last_kick_ms: AtomicU64,
 }
@@ -148,6 +151,17 @@ pub async fn route(state: &Arc<State>, req: Request<Incoming>) -> Routed {
 /// restart doesn't pay for either (Python's `_prewarm` equivalent). Phone
 /// A/B: cold list 1383/1140 ms on the first two journeys without this, then
 /// 393/281 ms.
+/// `{s["id"] for s in load_all_sessions(None)}` from the list engine's
+/// latest unfiltered build — the same cache Python's `/api/orphans`
+/// reads — instead of a separate full parse per request. Serves the last
+/// build and lets the list's stale-while-revalidate refresh it.
+pub async fn known_session_ids(state: &Arc<State>) -> Option<Arc<HashSet<String>>> {
+    let eng = engine(state).await;
+    eng.payload(None).await?;
+    let known = eng.known.lock().unwrap().clone();
+    known
+}
+
 pub async fn prewarm(state: Arc<State>) {
     let t0 = std::time::Instant::now();
     let eng = engine(&state).await;
@@ -169,6 +183,7 @@ async fn engine(state: &Arc<State>) -> Arc<Engine> {
                 inflight: Mutex::default(),
                 built: tokio::sync::Notify::new(),
                 headless: Mutex::default(),
+                known: Mutex::default(),
                 last_poll_ms: AtomicU64::new(0),
                 last_kick_ms: AtomicU64::new(0),
             });
@@ -275,6 +290,13 @@ impl Engine {
         let _g = self.build_lock.lock().unwrap_or_else(|e| e.into_inner());
         let t0 = Instant::now();
         let (sessions, headless) = self.lb.build(filter);
+        if filter.is_none() {
+            let ids = sessions
+                .iter()
+                .filter_map(|s| s.v["id"].as_str().map(String::from))
+                .collect();
+            *self.known.lock().unwrap() = Some(Arc::new(ids));
+        }
         self.headless.lock().unwrap().insert(
             filter.map(str::to_string),
             (Instant::now(), Arc::new(headless)),

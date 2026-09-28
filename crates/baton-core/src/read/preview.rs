@@ -243,24 +243,21 @@ pub struct Extracted {
 
 /// `session_extractor.extract_session` as a resumable state: transcripts
 /// are append-only, so an active one is re-read only from where the last
-/// call stopped. Errors are sticky (Python raised on the whole file).
+/// call stopped. A record with the wrong shape (`"message": 123`,
+/// non-str content parts, …) is skipped; Python raised on the whole file
+/// and `/api/session` answered 500 (NEW-2).
 #[derive(Clone, Default)]
 pub struct ExtractState {
     turns: Vec<(bool, Option<String>, String)>,
     first_user: Option<String>,
     started: Option<String>,
     ended: Option<String>,
-    error: Option<String>,
 }
 
 impl ExtractState {
     fn feed_line(&mut self, line: &str) {
-        if self.error.is_some() {
-            return;
-        }
-        if let Err(e) = self.feed_inner(line) {
-            self.error = Some(e.0);
-        }
+        // feed_inner only mutates after every check passed.
+        let _ = self.feed_inner(line);
     }
 
     fn feed_inner(&mut self, line: &str) -> Result<(), PyErr> {
@@ -334,9 +331,6 @@ impl ExtractState {
     }
 
     fn finish(&self) -> Result<Option<Extracted>, PyErr> {
-        if let Some(e) = &self.error {
-            return Err(PyErr(e.clone()));
-        }
         if self.turns.is_empty() {
             return Ok(None);
         }
@@ -427,26 +421,34 @@ impl Extractor {
         let mut f = std::fs::File::open(path).map_err(|e| PyErr(e.to_string()))?;
         f.seek(SeekFrom::Start(t.offset))
             .map_err(|e| PyErr(e.to_string()))?;
-        let mut rest = Vec::new();
-        f.read_to_end(&mut rest).map_err(|e| PyErr(e.to_string()))?;
-        let cut = rest
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        if cut > 0 {
-            let text = String::from_utf8_lossy(&rest[..cut]);
+        // Read in bounded chunks, feeding complete lines as they arrive
+        // (a first extract of a 200 MB transcript no longer holds the
+        // whole file in memory).
+        let mut rest: Vec<u8> = Vec::new();
+        let mut chunk = vec![0u8; 4 << 20];
+        loop {
+            let k = f.read(&mut chunk).map_err(|e| PyErr(e.to_string()))?;
+            if k == 0 {
+                break;
+            }
+            rest.extend_from_slice(&chunk[..k]);
+            let Some(nl) = rest.iter().rposition(|&b| b == b'\n') else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&rest[..nl + 1]);
             for line in universal_lines(&text) {
                 t.state.feed_line(line);
             }
-            t.offset += cut as u64;
+            drop(text);
+            t.offset += nl as u64 + 1;
+            rest.drain(..nl + 1);
         }
-        if cut == rest.len() {
+        if rest.is_empty() {
             return t.state.finish();
         }
         // The unterminated last line counts too (Python reads to EOF).
         let mut tmp = t.state.clone();
-        let text = String::from_utf8_lossy(&rest[cut..]);
+        let text = String::from_utf8_lossy(&rest);
         for line in universal_lines(&text) {
             tmp.feed_line(line);
         }
@@ -672,7 +674,6 @@ pub fn codex_preview(session_id: &str, path: &Path, limit: i64) -> Preview {
         Err(super::CodexErr::Io) => {
             return Preview::Err(500, json!({"error": "session file unreadable"}))
         }
-        Err(super::CodexErr::Crash) => return Preview::Err(500, super::internal_error()),
     };
     let mut turns: Vec<&Value> = msgs
         .iter()

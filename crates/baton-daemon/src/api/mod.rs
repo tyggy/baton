@@ -6,6 +6,7 @@
 pub mod control;
 pub mod list;
 pub mod read;
+pub mod sysread;
 pub mod tmux;
 
 use crate::proxy::Body;
@@ -22,6 +23,10 @@ pub async fn route(state: &Arc<State>, req: Request<Incoming>) -> Routed {
         Err(req) => req,
     };
     let req = match read::route(state, req).await {
+        Ok(r) => return Ok(r),
+        Err(req) => req,
+    };
+    let req = match sysread::route(state, req).await {
         Ok(r) => return Ok(r),
         Err(req) => req,
     };

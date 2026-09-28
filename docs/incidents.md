@@ -749,7 +749,8 @@ cosmetic / annoyance.
 - **Symptom:** `errors.jsonl` has `FileNotFoundError` (`/nonexistent…`, and `~` not expanded)
   and `NotADirectoryError` (a file path) → 500.
 - **Root cause:** there is no validation before `os.scandir`.
-- **Fix:** open (Python). The daemon must answer 4xx, and parity should accept that divergence.
+- **Fix:** open (Python). Daemon (`fix/read`, `api/sysread.rs`): a missing dir → 404, a file → 400,
+  `~` / `~/x` expanded → 200; parity accepts the divergence (Python still 500s).
 - **Detection:** ANY: `GET /api/browse?dir=/nonexistent` → 404, `?dir=<file>` → 400,
   `?dir=~` → 200 (home) or 400, never 500.
 - **Runs on:** ANY.
@@ -789,12 +790,13 @@ parity scripts allow the divergence.
 | INC-045 | Malformed request bodies (invalid JSON, non-object JSON, wrong `Content-Type`) → 500 | 400 with a JSON error, for every POST endpoint | ANY |
 | INC-046 | A malformed tty map (`~/.claude/…tty map` with garbage or wrong types) hides orphans | `/api/orphans` ignores bad entries and still lists orphans; the list still builds | SANDBOX |
 | INC-047 | Resume ids unvalidated, then used in a glob | `POST /api/resume {session_id: "*"}` / `"../x"` / `"[a-f]*"` → 400; no pane spawned (fake-binary argv log stays empty) | SANDBOX |
-| INC-048 | Session ids used as glob wildcards in lookups | `/api/session/*`, `/api/messages/0*`, `/api/tail/?…` → 400/404, never another session's content | ANY |
+| INC-048 | Session ids used as glob wildcards in lookups | `/api/session/*`, `/api/messages/0*`, `/api/tail/?…` → 400/404, never another session's content. Daemon fixed (`fix/read`): ids must be a UUID or `agent-[A-Za-z0-9_-]+` before any lookup; ids with glob/path syntax (`* ? [ ] / \\`) → 400 `{"error":"invalid session id"}`, other malformed ids get Python's unknown-id answer (404, or 200 with no children) | ANY |
 | INC-049 | `a;b` in tmux path params is passed to tmux (command separator) | `/api/pane/a;b`, `/api/pane-stream/a%3Bb`, scroll `session:"a;b"` → 400 (`_is_safe_tmux_name` on every tmux entry point) | SANDBOX |
 | INC-050 | tmux prefix matching: `-t name` without `=` targets `name-2` or `name…` when `name` is gone | bench panes `csm-bench-a` (killed) and `csm-bench-ab` (alive): scroll/send/kill/pane to `csm-bench-a` → 404, and `csm-bench-ab` receives nothing | SANDBOX |
 | INC-051 | `/api/asset` crashes on latin-1 / non-UTF-8 filenames | file named `caf\xe9.txt` in an allowed root → 200 with correct bytes; `Content-Disposition` is RFC 5987-encoded | SANDBOX |
 | INC-052 | An unpaired markdown/HTML tag in a transcript drops the following text in the preview | fixture message `a <b> c` / `<details>x` → the preview HTML contains `c` / `x` | SANDBOX |
-| INC-053 | An invalid UTF-8 line in a transcript → `/api/messages` 500 | fixture transcript with a `\xff` line → 200, the other messages present | SANDBOX |
+| INC-053 | An invalid UTF-8 line in a transcript → `/api/messages` 500 | fixture transcript with a `\xff` line → 200, the other messages present. Daemon fixed (`fix/read`): the line is skipped | SANDBOX |
+| NEW-2 | A record of the wrong shape (`{"type":"assistant","message":123}`, non-str text parts, non-object Codex `payload`) → `/api/messages` and `/api/session` 500; a bad subagent `.meta.json` → `/api/children` 500 | append `message:123` + a truncated line to a fixture transcript → messages 200 with the other messages, session 200 (check `malformed-record`). Daemon fixed (`fix/read`): such records are skipped everywhere in `baton_core::read` (messages, preview, Codex messages/tail, children) | SANDBOX |
 | INC-054 | Codex activity signature only looks back 3 days, so older Codex sessions that become active don't trigger live deltas | touch a 10-day-old rollout → `sessions_delta` within 6 s | SANDBOX |
 | INC-055 | `load_catalog` makes a blocking Airtable call inside the list rebuild | with the network blackholed (proxy to `127.0.0.1:9`), rebuild < 2 s and the list is 200; the catalog loads async or from cache | SANDBOX |
 | INC-056 | Invalid UTF-8 in `ps` output disables the whole process walk (no running sessions detected) | ps shim emitting a `\xff` in one command line → other sessions are still detected as running | SANDBOX |

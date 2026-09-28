@@ -156,8 +156,9 @@ impl ReadConfig {
 
     /// `_find_claude_jsonl(session_id)`: the largest copy across project
     /// dirs, else a subagent transcript `agent-<id>.jsonl`.
+    /// Invalid ids (see [`valid_session_id`]) never reach the glob.
     pub fn find_claude_jsonl(&self, session_id: &str) -> Option<PathBuf> {
-        if !self.claude_projects.exists() || session_id.contains('/') || session_id.contains("..") {
+        if !valid_session_id(session_id) || !self.claude_projects.exists() {
             return None;
         }
         let matches = paths::glob(&self.claude_projects, &format!("*/{session_id}.jsonl")).ok()?;
@@ -185,7 +186,7 @@ impl ReadConfig {
 
     /// `_find_codex_rollout(session_id)`.
     pub fn find_codex_rollout(&self, session_id: &str) -> Option<PathBuf> {
-        if !is_uuid(session_id) || !self.codex_sessions.exists() {
+        if session_id.len() != 36 || !is_uuid(session_id) || !self.codex_sessions.exists() {
             return None;
         }
         paths::rglob(
@@ -195,6 +196,28 @@ impl ReadConfig {
         )
         .into_iter()
         .next()
+    }
+}
+
+/// A session id the read endpoints accept: a UUID (Claude sessions,
+/// Codex threads) or a subagent transcript id `agent-<alnum/_/->`.
+/// Anything else — glob metacharacters (`*`, `?`, `[`), path separators,
+/// `..`, percent-escapes, non-ASCII — is rejected before any lookup, so an
+/// id can never select another session's file (INC-048; Python globbed
+/// the raw id).
+pub fn valid_session_id(s: &str) -> bool {
+    if s.len() == 36 && is_uuid(s) {
+        return true;
+    }
+    match s.strip_prefix("agent-") {
+        Some(rest) => {
+            !rest.is_empty()
+                && rest.len() <= 128
+                && rest
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        }
+        None => false,
     }
 }
 
@@ -209,51 +232,81 @@ fn is_uuid(s: &str) -> bool {
         })
 }
 
+/// The last lines of a file: one buffer plus line ranges (no per-line
+/// copies).
+#[derive(Default)]
+pub struct TailLines {
+    buf: Vec<u8>,
+    ranges: Vec<(usize, usize)>,
+}
+
+impl TailLines {
+    pub fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        self.ranges.iter().map(|&(a, b)| &self.buf[a..b])
+    }
+}
+
 /// `_tail_jsonl_lines(path, target_lines)`: raw lines (split on b"\n",
-/// the first dropped when the read didn't reach the start).
-pub fn tail_jsonl_lines(path: &Path, target_lines: usize) -> Vec<Vec<u8>> {
+/// the first dropped when the read didn't reach the start). The region is
+/// located by counting newlines backwards in 64 KB chunks, then read once
+/// into a single buffer.
+pub fn tail_jsonl_lines(path: &Path, target_lines: usize) -> TailLines {
     const CHUNK: u64 = 64 * 1024;
     let Ok(mut f) = std::fs::File::open(path) else {
-        return Vec::new();
+        return TailLines::default();
     };
     let Ok(end) = f.seek(SeekFrom::End(0)) else {
-        return Vec::new();
+        return TailLines::default();
     };
     if end == 0 {
-        return Vec::new();
+        return TailLines::default();
     }
-    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut chunk = vec![0u8; CHUNK as usize];
     let mut newlines = 0usize;
     let mut pos = end;
     while pos > 0 && newlines <= target_lines {
         let read_size = CHUNK.min(pos);
         pos -= read_size;
-        let mut chunk = vec![0u8; read_size as usize];
-        if f.seek(SeekFrom::Start(pos)).is_err() || f.read_exact(&mut chunk).is_err() {
-            return Vec::new();
+        let c = &mut chunk[..read_size as usize];
+        if f.seek(SeekFrom::Start(pos)).is_err() || f.read_exact(c).is_err() {
+            return TailLines::default();
         }
-        newlines += chunk.iter().filter(|&&b| b == b'\n').count();
-        chunks.push(chunk);
+        newlines += c.iter().filter(|&&b| b == b'\n').count();
     }
-    let mut buf = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
-    for c in chunks.iter().rev() {
-        buf.extend_from_slice(c);
+    drop(chunk);
+    let mut buf = vec![0u8; (end - pos) as usize];
+    if f.seek(SeekFrom::Start(pos)).is_err() || f.read_exact(&mut buf).is_err() {
+        return TailLines::default();
     }
-    let mut lines: Vec<Vec<u8>> = buf.split(|&b| b == b'\n').map(<[u8]>::to_vec).collect();
-    if pos > 0 && !lines.is_empty() {
-        lines.remove(0);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for (i, &b) in buf.iter().enumerate() {
+        if b == b'\n' {
+            ranges.push((start, i));
+            start = i + 1;
+        }
     }
-    if lines.len() > target_lines {
-        lines.drain(..lines.len() - target_lines);
+    ranges.push((start, buf.len()));
+    if pos > 0 {
+        ranges.remove(0);
     }
-    lines
+    if ranges.len() > target_lines {
+        ranges.drain(..ranges.len() - target_lines);
+    }
+    TailLines { buf, ranges }
 }
 
 pub enum CodexErr {
     /// OSError: "session file unreadable"
     Io,
-    /// anything else Python would have raised
-    Crash,
 }
 
 /// `_codex_messages(path, limit)`.
@@ -264,11 +317,10 @@ pub fn codex_messages(path: &Path, limit: i64) -> Result<Vec<Value>, CodexErr> {
     loop {
         let lines = tail_jsonl_lines(path, tail);
         msgs = Vec::new();
-        for l in &lines {
-            match messages::codex_line_to_message(l) {
-                Ok(Some(m)) => msgs.push(m),
-                Ok(None) => {}
-                Err(_) => return Err(CodexErr::Crash),
+        for l in lines.iter() {
+            // A malformed record is skipped, not fatal (Python raised).
+            if let Ok(Some(m)) = messages::codex_line_to_message(l) {
+                msgs.push(m);
             }
         }
         if msgs.len() as i64 >= limit || lines.len() < tail || tail >= 400_000 {
@@ -287,7 +339,6 @@ pub enum MessagesErr {
     Unreadable,
     /// `send_json({"error": str(e)}, 500)`
     Error(String),
-    Crash,
 }
 
 pub struct Messages {
@@ -322,7 +373,6 @@ pub fn session_messages(
         let out = match codex_messages(&codex, limit) {
             Ok(m) => m,
             Err(CodexErr::Io) => return Err(MessagesErr::Unreadable),
-            Err(CodexErr::Crash) => return Err(MessagesErr::Crash),
         };
         let n = out.len();
         return Ok(Messages {
@@ -338,8 +388,7 @@ pub fn session_messages(
     let mut messages;
     loop {
         let lines = tail_jsonl_lines(&path, tail_size);
-        messages = messages::parse_claude_lines(policy, lines.iter().map(Vec::as_slice))
-            .map_err(|e| MessagesErr::Error(e.0))?;
+        messages = messages::parse_claude_lines(policy, lines.iter());
         let consumed_whole = lines.len() < tail_size;
         if limit <= 0 || messages.len() as i64 >= limit || consumed_whole {
             break;
@@ -350,8 +399,7 @@ pub fn session_messages(
             messages = messages::parse_claude_lines(
                 policy,
                 messages::universal_lines(&text).map(str::as_bytes),
-            )
-            .map_err(|e| MessagesErr::Error(e.0))?;
+            );
             break;
         }
         tail_size *= 4;
@@ -464,11 +512,12 @@ pub fn tail_start_offset(path: &Path, since: Option<&str>) -> std::io::Result<u6
 
 /// One tick of `_stream_tail`: given the pending partial line and new
 /// bytes, the SSE payload to write (`data: <record>\n\n` per complete
-/// line) and the new pending tail. `Err` = the stream dies (Python raised).
-pub fn tail_events(pending: &mut Vec<u8>, chunk: &[u8], codex: bool) -> Result<Vec<u8>, PyErr> {
+/// line) and the new pending tail. Malformed Codex records are skipped
+/// (Python's stream died on them).
+pub fn tail_events(pending: &mut Vec<u8>, chunk: &[u8], codex: bool) -> Vec<u8> {
     pending.extend_from_slice(chunk);
     let Some(cut) = pending.iter().rposition(|&b| b == b'\n') else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let complete: Vec<u8> = pending[..cut].to_vec();
     pending.drain(..cut + 1);
@@ -498,7 +547,8 @@ pub fn tail_events(pending: &mut Vec<u8>, chunk: &[u8], codex: bool) -> Result<V
             continue;
         }
         if codex {
-            if let Some(rec) = messages::codex_line_to_tail_record(raw)? {
+            // A malformed record is skipped; the stream lives on.
+            if let Ok(Some(rec)) = messages::codex_line_to_tail_record(raw) {
                 out.extend_from_slice(b"data: ");
                 out.extend_from_slice(rec.as_bytes());
                 out.extend_from_slice(b"\n\n");
@@ -509,7 +559,7 @@ pub fn tail_events(pending: &mut Vec<u8>, chunk: &[u8], codex: bool) -> Result<V
             out.extend_from_slice(b"\n\n");
         }
     }
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
@@ -525,8 +575,54 @@ mod tests {
             Some(&b"2026-01-01T00:00:00Z"[..])
         );
         let mut pending = Vec::new();
-        let out = tail_events(&mut pending, b"{\"a\":1}\n{\"b\"", false).unwrap();
+        let out = tail_events(&mut pending, b"{\"a\":1}\n{\"b\"", false);
         assert_eq!(out, b"data: {\"a\":1}\n\n");
         assert_eq!(pending, b"{\"b\"");
+    }
+
+    #[test]
+    fn session_id_validation() {
+        assert!(valid_session_id("019a1b2c-3d4e-5f60-7182-93a4b5c6d7e8"));
+        assert!(valid_session_id("agent-a1b2c3d4"));
+        for bad in [
+            "",
+            "*",
+            "a*",
+            "0*",
+            "[a-f]*",
+            "?",
+            "agent-",
+            "agent-*",
+            "../x",
+            "a;b",
+            "%2A",
+            "019a1b2c-3d4e-5f60-7182-93a4b5c6d7e8\n",
+            "019a1b2c-3d4e-5f60-7182-93a4b5c6d7e*",
+        ] {
+            assert!(!valid_session_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn bad_lines_are_skipped() {
+        let policy = AssetPolicy::new("/nonexistent", None);
+        let good = br#"{"type":"user","message":{"role":"user","content":"hi"}}"#;
+        let lines: Vec<&[u8]> = vec![
+            b"{\"type\":\"user\",\"message\":{\"content\":\"\xff\"}}",
+            br#"{"type":"assistant","message":123}"#,
+            br#"{"type":"assistant","message":{"content":[{"type":"text","text":5}]}}"#,
+            br#"{"type":"user","message":{"role":"us"#,
+            good,
+        ];
+        let out = messages::parse_claude_lines(&policy, lines);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["blocks"][0]["text"], "hi");
+        let mut pending = Vec::new();
+        assert!(tail_events(
+            &mut pending,
+            b"{\"type\":\"response_item\",\"payload\":7}\n",
+            true
+        )
+        .is_empty());
     }
 }
