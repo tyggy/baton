@@ -37,10 +37,16 @@ settings:
     ALWAYS_SEARCH_USER_PATHS: NO
     GENERATE_INFOPLIST_FILE: NO
 
+packages:
+  PathDetect:
+    path: ../PathDetect
+
 targets:
   BatonMac:
     type: application
     platform: macOS
+    dependencies:
+      - package: PathDetect
     sources:
       - path: BatonMac
         excludes:

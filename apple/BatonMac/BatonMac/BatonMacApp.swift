@@ -51,6 +51,7 @@ extension View {
             .environmentObject(m.daemon)
             .environmentObject(m.permissions)
             .environmentObject(m.tailscale)
+            .environmentObject(m.clip)
     }
 }
 
@@ -66,6 +67,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_: Notification) {
         MainActor.assumeIsolated {
             let m = AppModel.shared
+            if let text = LaunchOptions.value("--clip-resolve") {
+                // Debug path only: no polling, no Tailscale, no pasteboard.
+                m.clip.listenAddress = { [daemon = m.daemon] in daemon.listen }
+                Task { @MainActor in
+                    await ClipDebug.resolve(text)
+                    exit(0)
+                }
+                return
+            }
             m.start()
             switch LaunchOptions.daemonAction {
             case "register": m.daemon.register()
@@ -73,11 +83,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             default: break
             }
             if LaunchOptions.show == "settings" { Snapshots.showSettingsPreview() }
+            if LaunchOptions.show == "hud" { m.clip.hud.showDemo(kind: LaunchOptions.value("--hud") ?? "opened") }
             if LaunchOptions.openOnboardingAtLaunch || LaunchOptions.show != nil { NSApp.activate() }
             if let path = LaunchOptions.snapshot {
                 Task { @MainActor in
                     try? await Task.sleep(for: .seconds(4))
-                    guard await Snapshots.makeKey(windowID: LaunchOptions.show ?? "onboarding") else {
+                    // The HUD is a non-activating panel: it's never key by design.
+                    // `--allow-inactive`: write anyway (e.g. the screen is locked).
+                    var isKey = LaunchOptions.show == "hud" ? true : await Snapshots.makeKey(windowID: LaunchOptions.show ?? "onboarding")
+                    if !isKey && LaunchOptions.args.contains("--allow-inactive") { isKey = true }
+                    guard isKey else {
                         FileHandle.standardError.write(Data("snapshot: window never became key; not writing an inactive-looking image\n".utf8))
                         exit(3)
                     }
@@ -95,6 +110,7 @@ final class AppModel: ObservableObject {
     let daemon = DaemonController()
     let permissions = Permissions()
     let tailscale = TailscaleModel()
+    let clip = ClipWatcher()
     private var tsTimer: Timer?
 
     static let menuSymbolRunning = "point.3.connected.trianglepath.dotted"
@@ -107,6 +123,8 @@ final class AppModel: ObservableObject {
 
     func start() {
         daemon.startPolling()
+        clip.listenAddress = { [daemon] in daemon.listen }
+        clip.start()
         permissions.refreshAll(includeDocuments: false)
         tailscale.refresh()
         tsTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
@@ -115,6 +133,36 @@ final class AppModel: ObservableObject {
                 AppModel.shared.permissions.refreshAll(includeDocuments: false)
             }
         }
+    }
+}
+
+/// `--clip-resolve <text>`: run detection and resolution the way a copy
+/// from the frontmost terminal would (real tmux context, `--clip-base`
+/// extras) and print the result as JSON. Doesn't touch the pasteboard or
+/// open anything.
+@MainActor
+enum ClipDebug {
+    static func resolve(_ text: String) async {
+        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let (res, snap) = await AppModel.shared.clip.handle(
+            text: text, frontBundleID: front, frontIsTerminal: true, act: false)
+        var out: [String: Any] = ["text": text, "front_app": front as Any? ?? NSNull()]
+        if let res {
+            let c = res.candidate
+            out["candidate"] = ["kind": c.kind.rawValue, "path": c.path, "line": c.line as Any? ?? NSNull(), "column": c.column as Any? ?? NSNull()] as [String: Any]
+            out["outcome"] = "\(res.outcome)"
+            out["matches"] = res.matches.map { ["path": $0.path, "dir": $0.isDirectory, "base": $0.base?.path as Any? ?? NSNull(), "source": $0.base?.source ?? "absolute"] }
+            out["truncated"] = res.searchTruncated
+        } else {
+            out["candidate"] = NSNull()
+        }
+        if let snap {
+            out["front_session"] = snap.frontSession as Any? ?? NSNull()
+            out["bases"] = snap.bases.map { "\($0.tier) \($0.path) (\($0.source))" }
+            out["note"] = snap.note
+        }
+        let data = (try? JSONSerialization.data(withJSONObject: out, options: [.prettyPrinted, .sortedKeys])) ?? Data()
+        FileHandle.standardOutput.write(data + Data("\n".utf8))
     }
 }
 

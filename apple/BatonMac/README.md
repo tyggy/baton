@@ -48,6 +48,44 @@ addresses, logs and "Show Setup Again…".
 Screenshots: `docs/onboarding-step-{1..5}-{light,dark}.png`,
 `docs/settings-status-light.png`.
 
+## Copy to Open
+
+Copy a path in a terminal — `src/api/read.rs:120`, `read.rs`, `@docs/api.md`,
+`~/x/y.md`, `file:///…` — and Baton opens it. The pasteboard's change count
+is polled every 0.4 s; contents are read only when the frontmost app is a
+terminal (editable list), the copy isn't marked concealed/transient
+(password managers), and paste access isn't denied. Detection and
+resolution live in the AppKit-free package `apple/PathDetect` (unit tests:
+`swift test` there), so the iPhone app can reuse them.
+
+Partial paths are resolved against, in order: the frontmost tab's tmux
+session cwd (Terminal tab tty → `tmux list-clients`; other terminals: the
+client with the latest activity), Claude sessions active in the last 24 h
+(daemon `/api/local-sessions` → their tmux panes' cwd), other tmux sessions
+active in the last 24 h, each followed by its git root. Bare names and
+unjoined relative paths get a bounded search (depth 6, 200 ms, skips
+`.git`/`node_modules`/`target`/`build`/`.venv`/DerivedData…). One hit
+opens; several show a chooser; none shows a short "no match" (setting).
+tmux is only read (`list-clients`, `list-panes`).
+
+Open: directories reveal in Finder; with a line number, VS Code / Cursor /
+Zed / BBEdit open at the line through their URL schemes, Xcode through
+`xed -l`, Sublime through `subl file:line`; otherwise the default app.
+Apps, installers, `.command`/`.terminal` files and executables (anything
+whose "open" would run it) are revealed instead. The HUD (top right,
+non-activating, ~3 s) has Reveal and Quick Look. Settings → Copy to Open:
+mode (Open / Quick Look / Ask First), editor for line numbers, terminal-only
+and its app list, "no match" hint, paste-access status. Menu → Open Copied
+Paths pauses it.
+
+Debug: `Baton --clip-resolve 'src/api/read.rs:120' [--clip-base DIR]`
+prints the candidate, bases and matches as JSON (no pasteboard, opens
+nothing); `--clip-debug` logs every clipboard step to stderr.
+Screenshots: `docs/clip-hud-{opened,choose}-light.png`,
+`docs/clip-hud-opened-dark.png`, `docs/settings-clip-{light,dark}.png`
+(`--show hud --hud opened|ask|choose|nomatch`, `--show settings
+--settings-tab clip`).
+
 ## Layout
 
 | Path | What |
@@ -59,6 +97,11 @@ Screenshots: `docs/onboarding-step-{1..5}-{light,dark}.png`,
 | `BatonMac/Views/Onboarding/` | setup flow (`SetupFlow`, `Pages`, `SetupScaffold`) |
 | `BatonMac/Views/Settings/` | Settings scene: Status and Advanced tabs |
 | `BatonMac/Services/PairingWatcher.swift` | detects the first iPhone connection |
+| `BatonMac/Services/ClipWatcher.swift` | Copy to Open: pasteboard polling, gates, settings |
+| `BatonMac/Services/ClipContext.swift` | base directories (tmux read-only, daemon session list) |
+| `BatonMac/Services/ClipActions.swift` | open / open at line / reveal / Quick Look, run-safety check |
+| `BatonMac/Views/ClipHUD.swift` | the HUD panel and chooser |
+| `../PathDetect/` | path-like test, `:line` parsing, resolution (Foundation only) |
 
 ## Daemon config
 

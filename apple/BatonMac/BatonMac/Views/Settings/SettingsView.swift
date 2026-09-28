@@ -1,13 +1,17 @@
 import AppKit
 import SwiftUI
 
-/// Settings scene: Status (every check, including optional permissions) and
-/// Advanced (daemon address, logs, setup again).
+/// Settings scene: Status (every check, including optional permissions),
+/// Copy to Open (clipboard path opener) and Advanced (daemon address, logs,
+/// setup again).
 struct SettingsView: View {
+    @State private var tab = LaunchOptions.value("--settings-tab") ?? "status"
+
     var body: some View {
-        TabView {
-            Tab("Status", systemImage: "checkmark.seal") { StatusPane() }
-            Tab("Advanced", systemImage: "gearshape.2") { AdvancedPane() }
+        TabView(selection: $tab) {
+            Tab("Status", systemImage: "checkmark.seal", value: "status") { StatusPane() }
+            Tab("Copy to Open", systemImage: "doc.on.clipboard", value: "clip") { ClipSettingsPane() }
+            Tab("Advanced", systemImage: "gearshape.2", value: "advanced") { AdvancedPane() }
         }
         .frame(width: 600, height: 620)
     }

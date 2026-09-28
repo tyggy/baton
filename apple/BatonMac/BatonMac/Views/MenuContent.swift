@@ -5,6 +5,7 @@ struct MenuContent: View {
     @EnvironmentObject var daemon: DaemonController
     @EnvironmentObject var permissions: Permissions
     @EnvironmentObject var tailscale: TailscaleModel
+    @EnvironmentObject var clip: ClipWatcher
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
 
@@ -12,6 +13,10 @@ struct MenuContent: View {
         Text(daemon.statusLine)
         Text(permissions.requiredMissing ? "Terminal access: needed" : "Terminal access: allowed")
         Text(tailscale.summary)
+        Divider()
+        if clip.enabled {
+            Toggle("Open Copied Paths", isOn: Binding(get: { !clip.paused }, set: { clip.paused = !$0 }))
+        }
         Divider()
         Button("Pair iPhone…") { NSApp.activate(); openWindow(id: "pairing") }
         Button("Show Setup Again…") { NSApp.activate(); openWindow(id: "onboarding") }
