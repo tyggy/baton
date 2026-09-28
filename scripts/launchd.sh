@@ -22,7 +22,7 @@ case "$cmd" in
     while [[ $# -gt 0 ]]; do
       case "$1" in --listen) listen="$2"; shift 2;; --upstream) upstream="$2"; shift 2;; *) echo "unknown $1"; exit 2;; esac
     done
-    id="$(date +%Y%m%d-%H%M%S)-$("$bin" 2>&1 | head -1 | awk '{print $2}')"
+    id="$(date +%Y%m%d-%H%M%S)-$( ("$bin" 2>&1 || true) | head -1 | awk '{print $2}')"
     mkdir -p "$BASE/releases/$id"
     cp "$bin" "$BASE/releases/$id/baton"
     ln -sfn "$BASE/releases/$id" "$BASE/current"
