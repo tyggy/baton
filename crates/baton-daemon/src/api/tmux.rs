@@ -891,11 +891,41 @@ async fn focus_terminal_tab(name: String) {
     spawn_osascript(&text::focus_tab_script(tty));
 }
 
+/// Claude Code's background-agent/shell picker has focus: "↑/↓ to select"
+/// with the "⏺ main" row near the bottom (the list grows with each running
+/// sub-agent). Narrow on purpose: an Esc on other screens would cancel a
+/// permission prompt or interrupt a running turn.
+async fn in_agent_picker(t: &str) -> bool {
+    let (out, _, rc) = run_cmd(&["tmux", "capture-pane", "-p", "-t", t], 3.0).await;
+    rc == 0 && picker_focused(&out)
+}
+
+fn picker_focused(screen: &str) -> bool {
+    let tail: Vec<&str> = screen
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(30)
+        .collect();
+    tail.iter().any(|l| l.contains("↑/↓ to select")) && tail.iter().any(|l| l.contains("⏺ main"))
+}
+
 async fn send(state: &State, body: &Py, headers: &HeaderMap) -> Handled {
     let f = Fields(body);
     let session = session_of(&f)?;
     let message = f.str_or("message", "")?;
     let t = target::pane(session);
+    if in_agent_picker(&t).await {
+        // Focus is on Claude Code's background-agent/shell list (↓ on an
+        // empty prompt opens it): typed text and Enter would go to the
+        // list and the message would be lost. Esc returns to the input.
+        run_cmd(&["tmux", "send-keys", "-t", &t, "Escape"], 10.0).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        eprintln!(
+            "send_refocus session={session} still_in_picker={}",
+            in_agent_picker(&t).await
+        );
+    }
     // Text then Enter as two calls: a batched paste can swallow the Enter.
     let (_, err, rc) = run_cmd(
         &[
@@ -956,4 +986,21 @@ async fn send_key(state: &State, body: &Py, headers: &HeaderMap) -> Handled {
     }
     bump_session_activity(state, session);
     Ok(ok(headers))
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::picker_focused;
+
+    #[test]
+    fn focused_vs_listed() {
+        let rows: String = (0..12)
+            .map(|i| format!("  ◯ general-purpose  task{i}\n"))
+            .collect();
+        let focused = format!("x\n❯ \n────\n  ↑/↓ to select\n❯ ⏺ main\n{rows}");
+        let listed = format!("x\n❯ \n────\n  ⏵⏵ auto mode on · esc to interrupt\n  ⏺ main\n{rows}");
+        assert!(picker_focused(&focused));
+        assert!(!picker_focused(&listed));
+        assert!(!picker_focused("❯ 1. Yes\n  2. No\n  Esc to cancel\n"));
+    }
 }
