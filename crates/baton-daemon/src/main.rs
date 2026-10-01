@@ -4,6 +4,7 @@
 //! 501 when none is configured.
 
 mod api;
+use pyjson::Py;
 mod cli;
 mod cmd;
 mod config;
@@ -70,8 +71,76 @@ fn ensure_utf8_locale() {
     }
 }
 
+/// launchd gives agents a soft limit of 256 open files. Each phone
+/// connection, SSE stream, upstream socket and tmux child pipe uses one;
+/// raise the soft limit to the hard limit (capped) at start.
+fn raise_nofile_limit() {
+    unsafe {
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+            let want = rl.rlim_max.min(10_240);
+            if rl.rlim_cur < want {
+                rl.rlim_cur = want;
+                libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+            }
+        }
+    }
+}
+
+fn open_fds() -> usize {
+    std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0)
+}
+
+/// Stall detector. A task on the runtime bumps a heartbeat every second; a
+/// plain thread checks it. If the runtime makes no progress for 15 s, save
+/// a stack sample next to the logs (the evidence a hang otherwise takes
+/// with it) and abort, so launchd restarts the daemon instead of it
+/// answering nothing until someone notices.
+fn spawn_stall_watchdog(beat: Arc<std::sync::atomic::AtomicU64>) {
+    use std::sync::atomic::Ordering;
+    std::thread::Builder::new()
+        .name("stall-watchdog".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let last = beat.load(Ordering::Relaxed);
+            if last == 0 {
+                continue;
+            }
+            let now = logs::unix_now() as u64;
+            if now.saturating_sub(last) < 15 {
+                continue;
+            }
+            let dir = logs::dir();
+            let _ = std::fs::create_dir_all(&dir);
+            let file = dir.join(format!("hang-{}.txt", logs::local_ts().replace(':', "")));
+            eprintln!(
+                "baton: runtime stalled {}s (open fds {}); sampling to {} and aborting",
+                now - last,
+                open_fds(),
+                file.display()
+            );
+            let _ = std::process::Command::new("/usr/bin/sample")
+                .args([&std::process::id().to_string(), "3", "-file"])
+                .arg(&file)
+                .output();
+            logs::error(
+                "stall",
+                "RuntimeStall",
+                &format!("no progress for {}s; sample {}", now - last, file.display()),
+                vec![],
+                vec![("open_fds", Py::Int(open_fds() as i128))],
+            );
+            std::process::abort();
+        })
+        .expect("stall watchdog thread");
+}
+
 fn main() {
     ensure_utf8_locale();
+    raise_nofile_limit();
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(String::as_str) {
         Some("sessions") => {
@@ -142,6 +211,20 @@ async fn serve(cfg: config::Config) {
     let upstream = cfg.upstream.clone();
     let state = Arc::new(state::State::new(cfg));
     let listener = TcpListener::bind(listen).await.expect("bind");
+    let beat = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let beat = beat.clone();
+        tokio::spawn(async move {
+            loop {
+                beat.store(
+                    logs::unix_now() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+    }
+    spawn_stall_watchdog(beat);
     tokio::spawn(api::list::prewarm(state.clone()));
     tokio::spawn(state.push.clone().run(state.events.subscribe()));
     eprintln!(
@@ -152,9 +235,30 @@ async fn serve(cfg: config::Config) {
     if state.token.is_empty() && !listen.ip().is_loopback() {
         eprintln!("baton: warning: no bearer token and listening on {listen}; run `baton setup`");
     }
+    let mut accept_errors = 0u32;
     loop {
-        let Ok((stream, peer)) = listener.accept().await else {
-            continue;
+        let (stream, peer) = match listener.accept().await {
+            Ok(c) => {
+                accept_errors = 0;
+                c
+            }
+            Err(e) => {
+                // EMFILE and friends fail again immediately: retrying at
+                // once spun a core and served nothing. Back off and say so.
+                accept_errors += 1;
+                if accept_errors == 1 || accept_errors.is_multiple_of(100) {
+                    eprintln!("baton: accept failed ({e}); open fds {}", open_fds());
+                    logs::error(
+                        "accept",
+                        "AcceptError",
+                        &e.to_string(),
+                        vec![],
+                        vec![("open_fds", Py::Int(open_fds() as i128))],
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
         };
         let _ = stream.set_nodelay(true);
         let state = state.clone();
